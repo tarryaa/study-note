@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ja" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="ノート">
+  <meta name="application-name" content="勉強ノート">
+  <meta name="theme-color" content="#f4f3ef">
+  <meta name="format-detection" content="telephone=no">
+  <meta name="description" content="iPad と Apple Pencil のための手書きノート">
+  <title>勉強ノート</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/app.css">
+  <script>
+    // 起動時のちらつき防止（テーマを先に決める）
+    try {
+      var s = JSON.parse(localStorage.getItem('bn.settings.v1') || '{}');
+      var dark = s.theme === 'dark' || ((!s.theme || s.theme === 'system') && matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="library" class="view"></div>
+    <div id="editor" class="view" hidden></div>
+  </div>
+  <div id="overlay-root"></div>
+  <noscript>このアプリを使うには JavaScript を有効にしてください。</noscript>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
