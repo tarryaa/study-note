@@ -4,8 +4,12 @@
 //  - 書いている線は画面サイズの専用キャンバス(ink)に、pointermove の中で即座に描く
 //  - getCoalescedEvents で 240Hz の Apple Pencil 入力を全部拾う
 //  - 予測描画（getPredictedEvents / 自前の速度外挿）で体感遅延を減らす
-//  - ページは CSS transform でパン・ズーム（再描画なし）。止まってから高解像度で描き直す
-//  - 確定した線はページのキャンバスに 1 本だけ追記（全体再描画しない）
+//  - ページは CSS transform でパン・ズーム（再描画なし）
+//
+// 画質のための設計:
+//  - ページごとの「土台キャンバス」（ズームアウト時はズームに合わせて軽量化）
+//  - 拡大時は画面に見えている部分だけを 512px のタイルに分けて、表示倍率ちょうどの解像度で描く
+//    （パンで新しく見えた部分も、その場ですぐ高精細タイルを描き足す）
 import { h, clamp, uid, isDarkColor, reducedMotion } from './util.js';
 import { icon } from './icons.js';
 import { settings, saveSettings } from './settings.js';
@@ -14,16 +18,20 @@ import {
   splitStroke, itemPath, setItemPath, PEN_TYPES, pointInPoly, convexHull, insideFraction, cutStrokeByPoly,
 } from './ink.js';
 import { detectScribble } from './scribble.js';
-import { recognizeShape, snapLineEnd } from './shapes.js';
+import { recognizeShape, snapLineEnd, shapeGeometry } from './shapes.js';
 import { renderPageTo, renderRegion, drawItem, itemBounds, hitBox, textHeight, LINE_H } from './render.js';
 import { newPageData, cloneItem } from './store.js';
 
-const GAP = 40;
-export const MIN_Z = 0.15;
-export const MAX_Z = 8;
-const PAGE_PX = 8e6; // ページキャンバス 1 枚の最大ピクセル数
-const MEM_PX = 34e6; // ページキャンバス全体の最大ピクセル数（約 136MB）
-const SEL_PX = 6e6;
+const GAP = 72; // ページ同士の間隔（横並び）
+export const MAX_Z = 10;
+const BASE_PX = 4.5e6; // 土台キャンバス 1 枚の最大ピクセル数
+const MEM_PX = 22e6; // 土台キャンバス全体の上限
+const TILE = 512; // 高精細タイルの大きさ（デバイスピクセル）
+const MAX_TILES = 110;
+const SEL_PX = 10e6;
+const EDGE = 18; // 拡大時にページの端を寄せる位置（px）
+const HOLD_MS = 420; // 図形補正までの長押し時間
+const PULL = 120; // 最後のページで横に引っ張ってページを追加するまでの距離
 const now = () => performance.now();
 
 export const clipboard = { items: null, bb: null, assets: new Map() };
@@ -33,7 +41,7 @@ function coalesced(e) {
   try { evs = e.getCoalescedEvents ? e.getCoalescedEvents() : null; } catch (_) {}
   return evs && evs.length ? evs : [e];
 }
-function unionBB(items) {
+export function unionBB(items) {
   const b = [Infinity, Infinity, -Infinity, -Infinity];
   for (const it of items) {
     const q = it.bb;
@@ -52,10 +60,16 @@ function rubber(v, min, max, dim) {
   if (v > max) return max + rubberDist(v - max, dim);
   return v;
 }
-function softZoom(z) {
+function softZoom(z, minZ) {
   if (z > MAX_Z) return MAX_Z * Math.pow(z / MAX_Z, 0.3);
-  if (z < MIN_Z) return MIN_Z * Math.pow(z / MIN_Z, 0.3);
+  if (z < minZ) return minZ * Math.pow(z / minZ, 0.35);
   return z;
+}
+function polyPath(pts) {
+  const P = new Path2D();
+  for (let i = 0; i < pts.length; i += 3) P[i ? 'lineTo' : 'moveTo'](pts[i], pts[i + 1]);
+  P.closePath();
+  return P;
 }
 
 export function transformItem(it, cx, cy, m) {
@@ -76,7 +90,7 @@ export function transformItem(it, cx, cy, m) {
   o.bb = itemBounds(o);
   return o;
 }
-const translateItem = (it, dx, dy) => transformItem(it, 0, 0, { tx: dx, ty: dy, s: 1, r: 0 });
+export const translateItem = (it, dx, dy) => transformItem(it, 0, 0, { tx: dx, ty: dy, s: 1, r: 0 });
 
 export class Engine {
   constructor(stage, hooks = {}) {
@@ -84,10 +98,13 @@ export class Engine {
     this.hooks = hooks;
     this.dpr = Math.min(window.devicePixelRatio || 1, 3);
     this.world = h('div', { class: 'world' });
-    this.detailCv = h('canvas', { class: 'detail-layer' });
-    this.addBtn = h('button', { class: 'add-page-btn', html: `${icon('plus')}<span>ページを追加</span>` });
-    this.addBtn.addEventListener('click', () => this.hooks.onAddPageEnd && this.hooks.onAddPageEnd());
-    this.world.append(this.detailCv, this.addBtn);
+    this.ghost = h('button', {
+      class: 'page-ghost',
+      'data-ui': '',
+      html: `<span class="pg-in"><span class="pg-ic">${icon('plus')}</span><b>新しいページ</b><small>タップ／横にスワイプ</small></span>`,
+    });
+    this.ghost.addEventListener('click', () => this.hooks.onAddPageEnd && this.hooks.onAddPageEnd());
+    this.world.append(this.ghost);
     this.frozenCv = h('canvas', { class: 'ink-layer' });
     this.inkCv = h('canvas', { class: 'ink-layer' });
     this.inkWrap = h('div', { class: 'ink-wrap' }, this.frozenCv, this.inkCv);
@@ -98,17 +115,15 @@ export class Engine {
     this.frozenCtx = this.frozenCv.getContext('2d');
     this.inkCtx = this.inkCv.getContext('2d');
     this.fxCtx = this.fxCv.getContext('2d');
-    this.detailCtx = this.detailCv.getContext('2d');
 
     this.view = { tx: 0, ty: 0, z: 1 };
-    this.insets = { top: 0, bottom: 0, left: 0, right: 0 };
+    this.insets = { top: 0, bottom: 0, left: 0, right: 0, tool: 58 };
     this.sw = 0;
     this.sh = 0;
     this.rect = { left: 0, top: 0 };
     this.pvs = [];
     this.pvMap = new Map();
-    this.contentW = 794;
-    this.contentH = 1123;
+    this.tiles = new Map();
     this.tool = 'pen';
     this.accent = '#5b6cf0';
     this.undoStack = [];
@@ -126,11 +141,14 @@ export class Engine {
     this.fxAnim = 0;
     this._rq = 0;
     this._settleT = 0;
+    this._lvl = 0;
+    this._lvlT = 0;
     this.lastViewChange = 0;
     this.inkDirty = null;
+    this.frozenDirty = null;
     this.fxDirty = null;
-    this.detailOn = false;
-    this.detail = null;
+    this.pull = 0;
+    this.pullArmed = false;
     this.realPressure = false;
     this.loaded = false;
     this.viewInit = false;
@@ -172,7 +190,8 @@ export class Engine {
   onResize() {
     const r = this.stage.getBoundingClientRect();
     if (!r.width || !r.height) return;
-    const pw = this.sw, ph = this.sh;
+    const changed = Math.abs(r.width - this.sw) > 1 || Math.abs(r.height - this.sh) > 1;
+    const state = this.loaded && this.viewInit && this.sw && changed ? this.getViewState() : null;
     this.rect = r;
     this.sw = r.width;
     this.sh = r.height;
@@ -190,45 +209,91 @@ export class Engine {
     this.frozenDirty = null;
     this.fxDirty = null;
     if (!this.loaded) return;
-    if (!this.viewInit) {
-      this.initView();
-      return;
-    }
-    if (pw && (Math.abs(pw - this.sw) > 1 || Math.abs(ph - this.sh) > 1)) {
-      const { tx, ty, z } = this.view;
-      const prevFit = this.fitZoomFor(pw);
-      const wasFit = Math.abs(z - prevFit) / prevFit < 0.03;
-      const wx = (pw / 2 - tx) / z, wy = (this.insets.top - ty) / z;
-      const nz = wasFit ? this.fitZoom() : z;
-      this.setView(this.sw / 2 - wx * nz, this.insets.top - wy * nz, nz);
-      this.clampNow();
-    } else this.onViewChanged();
+    if (!this.viewInit) return this.initView();
+    if (state) this.applyViewState(state, true);
+    else this.onViewChanged();
   }
 
   setInsets(ins) {
-    const prevFit = this.sw ? this.fitZoom() : 0;
-    const prevTop = this.insets.top;
+    const state = this.loaded && this.viewInit && this.sw ? this.getViewState() : null;
     this.insets = { ...this.insets, ...ins };
-    if (!this.loaded || !this.viewInit) return;
-    const { ty, z } = this.view;
-    const nf = this.fitZoom();
-    if (prevFit && Math.abs(z - prevFit) / prevFit < 0.02 && Math.abs(nf - z) / z > 0.005) {
-      // 幅に合わせて表示していた場合は、新しい余白に合わせて再フィット
-      const wy = (prevTop + 16 - ty) / z;
-      const b = this.bounds(nf);
-      this.animateView({ tx: clamp(this.availCenterX(), b.minTx, b.maxTx), ty: clamp(this.insets.top + 16 - wy * nf, b.minTy, b.maxTy), z: nf }, 360);
-    } else this.snapBack();
+    if (state) this.applyViewState(state, false);
   }
 
-  fitZoomFor(sw) {
-    const avail = sw - this.insets.left - this.insets.right - (sw < 700 ? 16 : 56);
-    return clamp(avail / this.contentW, MIN_Z, 4);
+  // ---------------------------------------------------------------- 表示領域・余白・ズーム範囲
+  area() {
+    const i = this.insets;
+    const l = i.left, t = i.top, r = this.sw - i.right, b = this.sh - i.bottom;
+    return { l, t, r, b, w: Math.max(60, r - l), h: Math.max(60, b - t) };
+  }
+  margins() {
+    const D = this.insets.tool || 58;
+    return { t: D * settings.zoomMargin, s: D * settings.zoomMargin, b: D * settings.zoomMarginBottom };
+  }
+  // いちばん縮小したとき：ページ全体が見えて、まわりに余白が残る倍率
+  minZoomFor(pv) {
+    const A = this.area(), m = this.margins();
+    const zw = (A.w - 2 * m.s) / pv.page.w, zh = (A.h - m.t - m.b) / pv.page.h;
+    return clamp(Math.min(zw, zh), 0.05, MAX_Z);
+  }
+  fitWidthZoom(pv) {
+    const A = this.area();
+    return clamp((A.w - (this.sw < 700 ? 16 : 48)) / pv.page.w, this.minZoomFor(pv), MAX_Z);
   }
   fitZoom() {
-    return this.fitZoomFor(this.sw);
+    const pv = this.pvs[this.focusIndex()];
+    return pv ? this.fitWidthZoom(pv) : 1;
   }
-  availCenterX() {
-    return this.insets.left + (this.sw - this.insets.left - this.insets.right) / 2;
+  // ページを基準にした移動範囲（ページが画面に収まるなら中央に置く）
+  pageBounds(pv, z) {
+    const A = this.area(), m = this.margins();
+    const W = pv.page.w * z, H = pv.page.h * z;
+    let minTx, maxTx, minTy, maxTy;
+    if (W <= A.w - 2 * EDGE) minTx = maxTx = A.l + (A.w - W) / 2 - pv.x * z;
+    else {
+      maxTx = A.l + EDGE - pv.x * z;
+      minTx = A.r - EDGE - (pv.x + pv.page.w) * z;
+    }
+    if (H <= A.h - 2 * EDGE) {
+      const free = A.h - H;
+      const ratio = m.t + m.b > 0 ? m.t / (m.t + m.b) : 0.5;
+      minTy = maxTy = A.t + free * ratio - pv.y * z;
+    } else {
+      maxTy = A.t + EDGE - pv.y * z;
+      minTy = A.b - EDGE - (pv.y + pv.page.h) * z;
+    }
+    return { minTx, maxTx, minTy, maxTy };
+  }
+  // ドラッグ中の範囲：横は最初〜最後のページ、縦は今のページ
+  dragBounds(z) {
+    const n = this.pvs.length;
+    if (!n) return { minTx: 0, maxTx: 0, minTy: 0, maxTy: 0 };
+    const bF = this.pageBounds(this.pvs[0], z), bL = this.pageBounds(this.pvs[n - 1], z);
+    const b = this.pageBounds(this.pvs[this.focusIndex()], z);
+    return { minTx: bL.minTx, maxTx: bF.maxTx, minTy: b.minTy, maxTy: b.maxTy };
+  }
+  focusIndex() {
+    const n = this.pvs.length;
+    if (!n) return 0;
+    const { tx, ty, z } = this.view;
+    const A = this.area();
+    const cx = (A.l + A.r) / 2;
+    let best = 0, bov = -1, bd = Infinity;
+    for (let i = 0; i < n; i++) {
+      const pv = this.pvs[i];
+      const x0 = pv.x * z + tx, x1 = x0 + pv.page.w * z, y0 = pv.y * z + ty, y1 = y0 + pv.page.h * z;
+      const ov = Math.max(0, Math.min(x1, A.r) - Math.max(x0, A.l)) * Math.max(0, Math.min(y1, A.b) - Math.max(y0, A.t));
+      const d = Math.abs((x0 + x1) / 2 - cx);
+      if (ov > bov + 0.5 || (Math.abs(ov - bov) <= 0.5 && d < bd)) {
+        best = i;
+        bov = ov;
+        bd = d;
+      }
+    }
+    return best;
+  }
+  currentIndex() {
+    return this.focusIndex();
   }
 
   // ---------------------------------------------------------------- 読み込み
@@ -249,13 +314,14 @@ export class Engine {
     el.append(cv, num);
     const pv = { page, el, cv, ctx: null, scale: 0, sx: 1, sy: 1, dirty: true, hidden: null, x: 0, y: 0, num };
     this.pvMap.set(page, pv);
-    this.world.insertBefore(el, this.detailCv);
+    this.world.insertBefore(el, this.ghost);
     return pv;
   }
   unload() {
     if (this.action) this.cancelAction();
     this.commitText();
     this.clearSelection();
+    for (const [k, t] of this.tiles) this.removeTile(k, t);
     for (const pv of this.pvs) {
       pv.cv.width = 0;
       pv.cv.height = 0;
@@ -265,10 +331,6 @@ export class Engine {
     this.pvMap = new Map();
     this.undoStack = [];
     this.redoStack = [];
-    this.detailOn = false;
-    this.detailCv.style.display = 'none';
-    this.detailCv.width = 0;
-    this.detailCv.height = 0;
     this.clearInk();
     this.clearFx();
     cancelAnimationFrame(this.fxAnim);
@@ -276,6 +338,7 @@ export class Engine {
     this.touches.clear();
     this.tg = null;
     this.tapSess = null;
+    this.setPull(0);
     this.loaded = false;
     this.note = null;
   }
@@ -286,38 +349,66 @@ export class Engine {
   initView() {
     this.viewInit = true;
     const v = this.note && this.note.view;
-    if (v && isFinite(v.z) && v.z > 0 && isFinite(v.wy)) {
-      const z = clamp(v.z, MIN_Z, MAX_Z);
-      this.setView(this.availCenterX() - (v.wx || 0) * z, this.insets.top + 16 - v.wy * z, z);
-    } else {
-      this.setView(this.availCenterX(), this.insets.top + 16, this.fitZoom());
-    }
-    this.clampNow();
+    if (v && v.page != null && this.pvs[v.page] && isFinite(v.z) && isFinite(v.cx) && isFinite(v.cy)) this.applyViewState(v, true);
+    else this.goToPage(0, { anim: false, fit: true });
   }
   getViewState() {
+    const i = this.focusIndex();
+    const pv = this.pvs[i];
+    if (!pv) return null;
     const { tx, ty, z } = this.view;
-    return { z, wx: (this.availCenterX() - tx) / z, wy: (this.insets.top + 16 - ty) / z };
+    const A = this.area();
+    return {
+      page: i,
+      z,
+      cx: ((A.l + A.r) / 2 - tx) / z - pv.x,
+      cy: ((A.t + A.b) / 2 - ty) / z - pv.y,
+      fit: Math.abs(z - this.fitWidthZoom(pv)) / z < 0.02,
+      min: Math.abs(z - this.minZoomFor(pv)) / z < 0.02,
+    };
+  }
+  viewFromState(v) {
+    const pv = this.pvs[v.page] || this.pvs[0];
+    if (!pv) return null;
+    const z = v.min ? this.minZoomFor(pv) : v.fit ? this.fitWidthZoom(pv) : clamp(v.z, this.minZoomFor(pv), MAX_Z);
+    const A = this.area();
+    const b = this.pageBounds(pv, z);
+    return {
+      tx: clamp((A.l + A.r) / 2 - (pv.x + v.cx) * z, b.minTx, b.maxTx),
+      ty: clamp((A.t + A.b) / 2 - (pv.y + v.cy) * z, b.minTy, b.maxTy),
+      z,
+    };
+  }
+  applyViewState(v, instant) {
+    const t = this.viewFromState(v);
+    if (!t) return;
+    if (instant) this.setView(t.tx, t.ty, t.z);
+    else this.animateView(t, 320);
   }
 
   layout() {
-    let y = 0, maxW = 0;
+    let x = 0;
     this.pvs.forEach((pv, i) => {
       const { w, h: ph } = pv.page;
-      pv.x = -w / 2;
-      pv.y = y;
+      pv.x = x;
+      pv.y = -ph / 2;
       const s = pv.el.style;
       s.left = pv.x + 'px';
-      s.top = y + 'px';
+      s.top = pv.y + 'px';
       s.width = w + 'px';
       s.height = ph + 'px';
       s.background = pv.page.paper;
       pv.num.textContent = String(i + 1);
-      y += ph + GAP;
-      if (w > maxW) maxW = w;
+      x += w + GAP;
     });
-    this.contentH = Math.max(0, y - GAP);
-    this.contentW = maxW || 794;
-    this.addBtn.style.top = this.contentH + 30 + 'px';
+    const last = this.pvs[this.pvs.length - 1];
+    if (last) {
+      const g = this.ghost.style;
+      g.left = last.x + last.page.w + GAP + 'px';
+      g.top = last.y + 'px';
+      g.width = last.page.w + 'px';
+      g.height = last.page.h + 'px';
+    }
   }
 
   // ---------------------------------------------------------------- 表示（パン・ズーム）
@@ -332,49 +423,26 @@ export class Engine {
   }
   onViewChanged() {
     this.updateVisibility();
+    this.requestRender();
     if (this.sel) this.updateSelUi();
     if (this.textEdit) this.positionText();
     if (this.hooks.onView) this.hooks.onView(this.view);
     clearTimeout(this._settleT);
-    this._settleT = setTimeout(() => this.settle(), 160);
+    this._settleT = setTimeout(() => this.settle(), 140);
   }
   isSettled() {
-    return !this.tg && !this.anim && now() - this.lastViewChange > 120;
+    return !this.tg && !this.anim && now() - this.lastViewChange > 100;
   }
   settle() {
     if (!this.loaded) return;
     if (this.tg || this.anim) {
       clearTimeout(this._settleT);
-      this._settleT = setTimeout(() => this.settle(), 160);
+      this._settleT = setTimeout(() => this.settle(), 140);
       return;
     }
     this.requestRender();
-    this.updateDetail();
     if (this.sel && Math.abs(this.sel.k - this.view.z * this.dpr) / this.sel.k > 0.3) this.renderSelCanvas();
     if (this.hooks.onSettle) this.hooks.onSettle();
-  }
-  bounds(z) {
-    const { sw, sh } = this;
-    const ins = this.insets;
-    const availW = sw - ins.left - ins.right;
-    const half = (this.contentW / 2) * z;
-    let minTx, maxTx;
-    if (half * 2 + 48 <= availW) minTx = maxTx = ins.left + availW / 2;
-    else {
-      maxTx = ins.left + 24 + half;
-      minTx = sw - ins.right - 24 - half;
-    }
-    const maxTy = ins.top + 16;
-    let minTy = sh - ins.bottom - 130 - this.contentH * z;
-    const last = this.pvs[this.pvs.length - 1];
-    if (last) minTy = Math.min(minTy, ins.top + 16 - last.y * z);
-    if (minTy > maxTy) minTy = maxTy;
-    return { minTx, maxTx, minTy, maxTy };
-  }
-  clampNow() {
-    const { tx, ty, z } = this.view;
-    const b = this.bounds(z);
-    this.setView(clamp(tx, b.minTx, b.maxTx), clamp(ty, b.minTy, b.maxTy), z);
   }
   stopAnim() {
     if (this.anim) {
@@ -395,21 +463,39 @@ export class Engine {
     };
     this.anim = requestAnimationFrame(step);
   }
-  snapBack() {
-    let { tx, ty, z } = this.view;
-    const nz = clamp(z, MIN_Z, MAX_Z);
-    if (nz !== z) {
-      const c = this.lastPinchC || { x: this.sw / 2, y: this.sh / 2 };
-      const wx = (c.x - tx) / z, wy = (c.y - ty) / z;
-      tx = c.x - wx * nz;
-      ty = c.y - wy * nz;
+  // ページから外れすぎていたら、ページが見える位置へ素早く戻す（横に強くはじくとページ送り）
+  settleView(opts = {}) {
+    if (!this.loaded || !this.pvs.length) return;
+    const { tx, ty, z } = this.view;
+    const A = this.area();
+    let i = this.focusIndex();
+    if (opts.vx && Math.abs(opts.vx) > 0.3) {
+      const base = opts.from != null && this.pvs[opts.from] ? opts.from : i;
+      if (this.pvs[base].page.w * z <= A.w * 1.05) i = clamp(base + (opts.vx < 0 ? 1 : -1), 0, this.pvs.length - 1);
     }
-    const b = this.bounds(nz);
-    const ntx = clamp(tx, b.minTx, b.maxTx), nty = clamp(ty, b.minTy, b.maxTy);
+    const pv = this.pvs[i];
+    const nz = clamp(z, this.minZoomFor(pv), MAX_Z);
+    let ntx = tx, nty = ty;
+    if (Math.abs(nz - z) > 1e-6) {
+      const c = this.lastPinchC || { x: (A.l + A.r) / 2, y: (A.t + A.b) / 2 };
+      const w = this.toWorld(c);
+      ntx = c.x - w.x * nz;
+      nty = c.y - w.y * nz;
+    }
+    const b = this.pageBounds(pv, nz);
+    ntx = clamp(ntx, b.minTx, b.maxTx);
+    nty = clamp(nty, b.minTy, b.maxTy);
+    this.lastPinchC = null;
     const v = this.view;
-    if (Math.abs(ntx - v.tx) > 0.5 || Math.abs(nty - v.ty) > 0.5 || Math.abs(nz - v.z) > 1e-4) this.animateView({ tx: ntx, ty: nty, z: nz }, 380);
+    if (Math.abs(ntx - v.tx) > 0.5 || Math.abs(nty - v.ty) > 0.5 || Math.abs(nz - v.z) > 1e-4) {
+      if (opts.instant) this.setView(ntx, nty, nz);
+      else this.animateView({ tx: ntx, ty: nty, z: nz }, opts.dur || 300);
+    }
   }
-  startInertia(vx, vy) {
+  snapBack() {
+    this.settleView();
+  }
+  startInertia(vx, vy, from) {
     this.stopAnim();
     let last = now();
     const step = () => {
@@ -422,20 +508,20 @@ export class Engine {
       let { tx, ty, z } = this.view;
       tx += vx * dt;
       ty += vy * dt;
-      const b = this.bounds(z);
-      const over = 70;
+      const b = this.dragBounds(z);
+      const over = 60;
       if (ty > b.maxTy || ty < b.minTy) {
-        vy *= Math.pow(0.55, dt / 16);
+        vy *= Math.pow(0.5, dt / 16);
         ty = clamp(ty, b.minTy - over, b.maxTy + over);
       }
       if (tx > b.maxTx || tx < b.minTx) {
-        vx *= Math.pow(0.55, dt / 16);
+        vx *= Math.pow(0.5, dt / 16);
         tx = clamp(tx, b.minTx - over, b.maxTx + over);
       }
-      if (Math.abs(vx) + Math.abs(vy) < 0.02) {
+      if (Math.abs(vx) + Math.abs(vy) < 0.03) {
         this.anim = 0;
         this.setView(tx, ty, z);
-        this.snapBack();
+        this.settleView({ from });
         return;
       }
       this.anim = requestAnimationFrame(step);
@@ -444,68 +530,77 @@ export class Engine {
     this.anim = requestAnimationFrame(step);
   }
   zoomBy(f, center) {
-    const c = center || { x: this.sw / 2, y: (this.insets.top + this.sh - this.insets.bottom) / 2 };
+    const A = this.area();
+    const c = center || { x: (A.l + A.r) / 2, y: (A.t + A.b) / 2 };
+    const pv = this.pvs[this.focusIndex()];
+    if (!pv) return;
     const { tx, ty, z } = this.view;
-    const nz = clamp(z * f, MIN_Z, MAX_Z);
+    const nz = clamp(z * f, this.minZoomFor(pv), MAX_Z);
     const wx = (c.x - tx) / z, wy = (c.y - ty) / z;
-    const b = this.bounds(nz);
+    const b = this.pageBounds(pv, nz);
     this.animateView({ tx: clamp(c.x - wx * nz, b.minTx, b.maxTx), ty: clamp(c.y - wy * nz, b.minTy, b.maxTy), z: nz }, 260);
   }
   fitWidth() {
-    const nz = this.fitZoom();
-    const { ty, z } = this.view;
-    const cy = this.insets.top + 16;
-    const wy = (cy - ty) / z;
-    const b = this.bounds(nz);
-    this.animateView({ tx: clamp(this.availCenterX(), b.minTx, b.maxTx), ty: clamp(cy - wy * nz, b.minTy, b.maxTy), z: nz }, 340);
+    this.goToPage(this.focusIndex(), { fit: true });
   }
-  toggleZoom(sp) {
-    const fit = this.fitZoom();
-    const z = this.view.z;
-    const target = z > fit * 1.3 ? fit : Math.min(MAX_Z, fit * 2.2);
-    const w = this.toWorld(sp);
-    const b = this.bounds(target);
-    this.animateView({ tx: clamp(sp.x - w.x * target, b.minTx, b.maxTx), ty: clamp(sp.y - w.y * target, b.minTy, b.maxTy), z: target }, 340);
-  }
-  scrollToPage(i, anim = true) {
+  zoomOutFull() {
+    const i = this.focusIndex();
     const pv = this.pvs[i];
     if (!pv) return;
+    const z = this.minZoomFor(pv);
+    const b = this.pageBounds(pv, z);
+    this.animateView({ tx: b.maxTx, ty: b.maxTy, z }, 340);
+  }
+  toggleZoom(sp) {
+    const w = this.toWorld(sp);
+    const pv = this.pageAt(w, 0) || this.pvs[this.focusIndex()];
+    if (!pv) return;
+    const fit = this.fitWidthZoom(pv);
     const z = this.view.z;
-    const b = this.bounds(z);
-    const ty = clamp(this.insets.top + 16 - pv.y * z, b.minTy, b.maxTy);
-    const tx = clamp(this.view.tx, b.minTx, b.maxTx);
-    if (anim) this.animateView({ tx, ty, z }, 440);
-    else this.setView(tx, ty, z);
+    const target = z > fit * 1.3 ? fit : Math.min(MAX_Z, fit * 2.2);
+    const b = this.pageBounds(pv, target);
+    this.animateView({ tx: clamp(sp.x - w.x * target, b.minTx, b.maxTx), ty: clamp(sp.y - w.y * target, b.minTy, b.maxTy), z: target }, 340);
+  }
+  goToPage(i, { anim = true, fit = false } = {}) {
+    const pv = this.pvs[i];
+    if (!pv) return;
+    const z = fit ? this.fitWidthZoom(pv) : clamp(this.view.z, this.minZoomFor(pv), MAX_Z);
+    const b = this.pageBounds(pv, z);
+    if (anim) this.animateView({ tx: b.maxTx, ty: b.maxTy, z }, 440);
+    else this.setView(b.maxTx, b.maxTy, z);
+  }
+  scrollToPage(i, anim = true) {
+    this.goToPage(i, { anim });
   }
   ensureVisible(pv, bb) {
     const { tx, ty, z } = this.view;
+    const A = this.area();
     const x0 = (pv.x + bb[0]) * z + tx, y0 = (pv.y + bb[1]) * z + ty;
     const x1 = (pv.x + bb[2]) * z + tx, y1 = (pv.y + bb[3]) * z + ty;
-    if (x1 > 0 && x0 < this.sw && y1 > this.insets.top && y0 < this.sh - this.insets.bottom) return;
-    const cy = (y0 + y1) / 2, cx = (x0 + x1) / 2;
-    const b = this.bounds(z);
-    const mid = (this.insets.top + this.sh - this.insets.bottom) / 2;
-    this.animateView({ tx: clamp(tx + this.sw / 2 - cx, b.minTx, b.maxTx), ty: clamp(ty + mid - cy, b.minTy, b.maxTy), z }, 380);
-  }
-  currentIndex() {
-    const vr = this.visibleRect();
-    const top = vr.y + this.insets.top / this.view.z;
-    const bottom = vr.y + vr.h - this.insets.bottom / this.view.z;
-    let best = 0, bv = -1;
-    this.pvs.forEach((pv, i) => {
-      const v = Math.min(bottom, pv.y + pv.page.h) - Math.max(top, pv.y);
-      if (v > bv) {
-        bv = v;
-        best = i;
-      }
-    });
-    return best;
+    if (x1 > A.l && x0 < A.r && y1 > A.t && y0 < A.b) return;
+    const nz = clamp(z, this.minZoomFor(pv), MAX_Z);
+    const cx = pv.x + (bb[0] + bb[2]) / 2, cy = pv.y + (bb[1] + bb[3]) / 2;
+    const b = this.pageBounds(pv, nz);
+    this.animateView({ tx: clamp((A.l + A.r) / 2 - cx * nz, b.minTx, b.maxTx), ty: clamp((A.t + A.b) / 2 - cy * nz, b.minTy, b.maxTy), z: nz }, 380);
   }
   pageScreenRect(i) {
     const pv = this.pvs[i];
     if (!pv) return null;
     const { tx, ty, z } = this.view;
     return { x: pv.x * z + tx + this.rect.left, y: pv.y * z + ty + this.rect.top, w: pv.page.w * z, h: pv.page.h * z };
+  }
+  // 最後のページを横に引っ張ったときの「新しいページ」表示
+  setPull(p) {
+    const v = Math.max(0, p);
+    if (v === this.pull) return;
+    this.pull = v;
+    const armed = v >= PULL;
+    this.ghost.style.setProperty('--pull', String(Math.min(1, v / PULL)));
+    this.ghost.classList.toggle('pulling', v > 4);
+    if (armed !== this.pullArmed) {
+      this.pullArmed = armed;
+      this.ghost.classList.toggle('armed', armed);
+    }
   }
 
   // ---------------------------------------------------------------- 描画
@@ -516,32 +611,29 @@ export class Engine {
   pvRect(pv) {
     return { x: pv.x, y: pv.y, w: pv.page.w, h: pv.page.h };
   }
-  nearRect(f = 0.8) {
+  nearRect(f = 0.6) {
     const vr = this.visibleRect();
-    const m = vr.h * f;
+    const m = Math.max(vr.w, vr.h) * f;
     return { x: vr.x - m, y: vr.y - m, w: vr.w + 2 * m, h: vr.h + 2 * m };
   }
   updateVisibility() {
     if (!this.loaded) return;
-    const near = this.nearRect(0.8), far = this.nearRect(1.8);
-    let need = false;
+    const near = this.nearRect(0.6), far = this.nearRect(1.6);
     let total = 0;
     const alive = [];
     for (const pv of this.pvs) {
       const r = this.pvRect(pv);
-      if (overlap(r, near)) {
-        if (pv.scale === 0 || pv.dirty) need = true;
-      } else if (pv.scale > 0 && !overlap(r, far)) this.releasePV(pv);
+      if (!overlap(r, near) && pv.scale > 0 && !overlap(r, far)) this.releasePV(pv);
       if (pv.scale > 0) {
         total += pv.cv.width * pv.cv.height;
         alive.push(pv);
       }
     }
-    // キャンバスの総メモリを制限（iPad の Safari はキャンバスメモリに上限がある）
+    // 土台キャンバスの総メモリを制限
     if (total > MEM_PX) {
       const vr = this.visibleRect();
-      const cy = vr.y + vr.h / 2;
-      alive.sort((a, b) => Math.abs(b.y + b.page.h / 2 - cy) - Math.abs(a.y + a.page.h / 2 - cy));
+      const cx = vr.x + vr.w / 2;
+      alive.sort((a, b) => Math.abs(b.x + b.page.w / 2 - cx) - Math.abs(a.x + a.page.w / 2 - cx));
       for (const pv of alive) {
         if (total <= MEM_PX) break;
         if (overlap(this.pvRect(pv), near)) continue;
@@ -549,23 +641,23 @@ export class Engine {
         this.releasePV(pv);
       }
     }
-    if (need) this.requestRender();
   }
   releasePV(pv) {
     pv.cv.width = 0;
     pv.cv.height = 0;
     pv.scale = 0;
     pv.dirty = true;
+    this.dropTiles(pv);
   }
   requestRender() {
     if (!this._rq) this._rq = requestAnimationFrame(() => this.renderTick());
   }
-  pageCap(pv) {
-    return Math.sqrt(PAGE_PX / (pv.page.w * pv.page.h));
+  baseCap(pv) {
+    return Math.sqrt(BASE_PX / (pv.page.w * pv.page.h));
   }
   targetScale(pv) {
     const want = Math.ceil(this.view.z * this.dpr * 4) / 4;
-    return Math.max(0.25, Math.min(this.pageCap(pv), want));
+    return Math.max(0.2, Math.min(this.baseCap(pv), want));
   }
   needsRender(pv) {
     if (pv.scale === 0 || pv.dirty) return true;
@@ -573,22 +665,27 @@ export class Engine {
     const t = this.targetScale(pv);
     return pv.scale < t * 0.92 || pv.scale > t * 1.8;
   }
+  needsTiles(pv) {
+    return this.view.z * this.dpr > this.baseCap(pv) * 1.03;
+  }
   renderTick() {
     this._rq = 0;
     if (!this.loaded) return;
     const t0 = now();
-    const near = this.nearRect(0.8);
+    const budget = this.tg ? 7 : 12;
+    const near = this.nearRect(0.6);
     const vr = this.visibleRect();
-    const cy = vr.y + vr.h / 2;
+    const cx = vr.x + vr.w / 2;
     const list = this.pvs.filter((pv) => overlap(this.pvRect(pv), near) && this.needsRender(pv));
-    list.sort((a, b) => Math.abs(a.y + a.page.h / 2 - cy) - Math.abs(b.y + b.page.h / 2 - cy));
+    list.sort((a, b) => Math.abs(a.x + a.page.w / 2 - cx) - Math.abs(b.x + b.page.w / 2 - cx));
     for (let i = 0; i < list.length; i++) {
-      this.renderPV(list[i]);
-      if (now() - t0 > 12 && i < list.length - 1) {
+      if (i > 0 && now() - t0 > budget) {
         this.requestRender();
-        break;
+        return;
       }
+      this.renderPV(list[i]);
     }
+    this.updateTiles(t0, budget);
   }
   renderPV(pv) {
     const t = this.targetScale(pv);
@@ -607,6 +704,128 @@ export class Engine {
   renderAllNow() {
     const vr = this.visibleRect();
     for (const pv of this.pvs) if (overlap(this.pvRect(pv), vr) && this.needsRender(pv)) this.renderPV(pv);
+    this.requestRender();
+  }
+
+  // ---- 高精細タイル
+  tileLevel() {
+    return Math.ceil(Math.log2(this.view.z * this.dpr) * 3 - 0.02);
+  }
+  updateTiles(t0, budget) {
+    const lvl = this.tileLevel();
+    const s = Math.pow(2, lvl / 3);
+    const Tw = TILE / s;
+    if (lvl !== this._lvl) {
+      this._lvl = lvl;
+      this._lvlT = now();
+    }
+    const pinching = this.tg && this.tg.mode === 'pinch';
+    const allow = !pinching || now() - this._lvlT > 140;
+    const vr = this.visibleRect();
+    const pad = Math.max(vr.w, vr.h) * 0.15;
+    const pre = { x: vr.x - pad, y: vr.y - pad, w: vr.w + 2 * pad, h: vr.h + 2 * pad };
+    const cx = vr.x + vr.w / 2, cy = vr.y + vr.h / 2;
+    const need = [];
+    const keep = new Set();
+    const tn = now();
+    for (const pv of this.pvs) {
+      if (!this.needsTiles(pv) || !overlap(this.pvRect(pv), pre)) continue;
+      const nx = Math.ceil(pv.page.w / Tw), ny = Math.ceil(pv.page.h / Tw);
+      const i0 = Math.max(0, Math.floor((pre.x - pv.x) / Tw)), i1 = Math.min(nx - 1, Math.floor((pre.x + pre.w - pv.x) / Tw));
+      const j0 = Math.max(0, Math.floor((pre.y - pv.y) / Tw)), j1 = Math.min(ny - 1, Math.floor((pre.y + pre.h - pv.y) / Tw));
+      for (let j = j0; j <= j1; j++) {
+        for (let i = i0; i <= i1; i++) {
+          const key = pv.page.id + '|' + lvl + '|' + i + '|' + j;
+          keep.add(key);
+          const t = this.tiles.get(key);
+          if (t && !t.dirty) {
+            t.used = tn;
+            continue;
+          }
+          const x = pv.x + i * Tw, y = pv.y + j * Tw;
+          const vis = overlap({ x, y, w: Tw, h: Tw }, vr);
+          need.push({ pv, i, j, key, d: Math.hypot(x + Tw / 2 - cx, y + Tw / 2 - cy) + (vis ? 0 : 1e7), vis });
+        }
+      }
+    }
+    need.sort((a, b) => a.d - b.d);
+    let done = 0;
+    if (allow) {
+      for (const n of need) {
+        if (done > 0 && now() - t0 > budget) break;
+        this.renderTile(n.pv, n.i, n.j, lvl, s, Tw, n.key);
+        done++;
+      }
+    }
+    const pending = need.slice(done);
+    if (pending.length) this.requestRender();
+    // 見えている部分が新しい解像度で揃ったら、古い解像度のタイルを片付ける
+    if (!pending.some((n) => n.vis)) {
+      for (const [key, t] of this.tiles) {
+        if (keep.has(key)) continue;
+        if (t.lvl !== lvl || !this.needsTiles(t.pv)) this.removeTile(key, t);
+      }
+    }
+    if (this.tiles.size > MAX_TILES) {
+      const old = [...this.tiles].filter(([k]) => !keep.has(k)).sort((a, b) => a[1].used - b[1].used);
+      while (this.tiles.size > MAX_TILES && old.length) {
+        const [k, t] = old.shift();
+        this.removeTile(k, t);
+      }
+    }
+  }
+  renderTile(pv, i, j, lvl, s, Tw, key) {
+    let t = this.tiles.get(key);
+    if (!t) {
+      const x = i * Tw, y = j * Tw;
+      // 隣のタイルと少し重ねて継ぎ目を消す
+      const w = Math.min(Tw + (x + Tw < pv.page.w ? 1.5 / s : 0), pv.page.w - x);
+      const hh = Math.min(Tw + (y + Tw < pv.page.h ? 1.5 / s : 0), pv.page.h - y);
+      const cv = h('canvas', { class: 'tile' });
+      const st = cv.style;
+      st.left = x + 'px';
+      st.top = y + 'px';
+      st.width = w + 'px';
+      st.height = hh + 'px';
+      st.zIndex = String(10 + lvl);
+      pv.el.append(cv);
+      t = { key, cv, ctx: cv.getContext('2d'), pv, lvl, x, y, w, h: hh, s, dirty: true, used: 0 };
+      this.tiles.set(key, t);
+    }
+    const W = Math.max(1, Math.round(t.w * s)), H = Math.max(1, Math.round(t.h * s));
+    if (t.cv.width !== W || t.cv.height !== H) {
+      t.cv.width = W;
+      t.cv.height = H;
+    }
+    t.kx = W / t.w;
+    t.ky = H / t.h;
+    t.ctx.setTransform(t.kx, 0, 0, t.ky, -t.x * t.kx, -t.y * t.ky);
+    renderRegion(t.ctx, pv.page, { x: t.x, y: t.y, w: t.w, h: t.h }, s, { hidden: pv.hidden, assets: this.assets });
+    t.dirty = false;
+    t.used = now();
+  }
+  removeTile(key, t) {
+    t.cv.width = 0;
+    t.cv.height = 0;
+    t.cv.remove();
+    this.tiles.delete(key);
+  }
+  dropTiles(pv) {
+    for (const [k, t] of this.tiles) if (t.pv === pv) this.removeTile(k, t);
+  }
+  tilesOf(pv, bb) {
+    const out = [];
+    for (const t of this.tiles.values()) {
+      if (t.pv !== pv || t.dirty) continue;
+      if (bb && (bb[0] > t.x + t.w || bb[2] < t.x || bb[1] > t.y + t.h || bb[3] < t.y)) continue;
+      out.push(t);
+    }
+    return out;
+  }
+  invalidatePage(pv) {
+    pv.dirty = true;
+    this.dropTiles(pv);
+    this.requestRender();
   }
   repaintRegion(pv, bb, pad = 2) {
     if (!bb || !isFinite(bb[0])) return;
@@ -619,66 +838,15 @@ export class Engine {
         renderRegion(pv.ctx, pv.page, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, sx, { hidden: pv.hidden, assets: this.assets });
       }
     } else this.requestRender();
-    if (this.detailOn) this.repaintDetail(pv, bb, pad);
-  }
-  repaintDetail(pv, bb, pad = 2) {
-    const d = this.detail;
-    if (!d) return;
-    const k = d.k;
-    let x0 = Math.max(bb[0] - pad, 0, d.x - pv.x), y0 = Math.max(bb[1] - pad, 0, d.y - pv.y);
-    let x1 = Math.min(bb[2] + pad, pv.page.w, d.x + d.w - pv.x), y1 = Math.min(bb[3] + pad, pv.page.h, d.y + d.h - pv.y);
-    if (x1 <= x0 || y1 <= y0) return;
-    const ox = (pv.x - d.x) * k, oy = (pv.y - d.y) * k;
-    x0 = Math.max(0, (Math.floor(x0 * k + ox) - ox) / k);
-    y0 = Math.max(0, (Math.floor(y0 * k + oy) - oy) / k);
-    x1 = Math.min(pv.page.w, (Math.ceil(x1 * k + ox) - ox) / k);
-    y1 = Math.min(pv.page.h, (Math.ceil(y1 * k + oy) - oy) / k);
-    const ctx = this.detailCtx;
-    ctx.setTransform(k, 0, 0, k, ox, oy);
-    renderRegion(ctx, pv.page, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, k, { hidden: pv.hidden, assets: this.assets });
-  }
-  // 拡大時にページキャンバスの解像度が足りない分を、画面サイズの高精細レイヤーで補う
-  updateDetail() {
-    if (!this.loaded) return;
-    const k = this.view.z * this.dpr;
-    const vr = this.visibleRect();
-    const vis = this.pvs.filter((pv) => overlap(this.pvRect(pv), vr));
-    const need = vis.some((pv) => this.pageCap(pv) < k * 0.96);
-    if (!need) {
-      if (this.detailOn) {
-        this.detailOn = false;
-        this.detail = null;
-        this.detailCv.style.display = 'none';
-        this.detailCv.width = 0;
-        this.detailCv.height = 0;
-      }
-      return;
+    const ex = [bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad];
+    for (const t of this.tilesOf(pv, ex)) {
+      const kx = t.kx, ky = t.ky;
+      const x0 = Math.max(t.x, t.x + Math.floor((ex[0] - t.x) * kx) / kx), y0 = Math.max(t.y, t.y + Math.floor((ex[1] - t.y) * ky) / ky);
+      const x1 = Math.min(t.x + t.w, t.x + Math.ceil((ex[2] - t.x) * kx) / kx), y1 = Math.min(t.y + t.h, t.y + Math.ceil((ex[3] - t.y) * ky) / ky);
+      if (x1 <= x0 || y1 <= y0) continue;
+      t.ctx.setTransform(kx, 0, 0, ky, -t.x * kx, -t.y * ky);
+      renderRegion(t.ctx, pv.page, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, t.s, { hidden: pv.hidden, assets: this.assets });
     }
-    const W = Math.round(this.sw * this.dpr), H = Math.round(this.sh * this.dpr);
-    const cv = this.detailCv;
-    if (cv.width !== W || cv.height !== H) {
-      cv.width = W;
-      cv.height = H;
-    }
-    const s = cv.style;
-    s.left = vr.x + 'px';
-    s.top = vr.y + 'px';
-    s.width = vr.w + 'px';
-    s.height = vr.h + 'px';
-    s.display = 'block';
-    this.detail = { x: vr.x, y: vr.y, w: vr.w, h: vr.h, k: W / vr.w };
-    this.detailOn = true;
-    const ctx = this.detailCtx;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, W, H);
-    for (const pv of vis) this.repaintDetail(pv, [0, 0, pv.page.w, pv.page.h], 0);
-  }
-  updateDetailSoon() {
-    if (this._dq) return;
-    this._dq = requestAnimationFrame(() => {
-      this._dq = 0;
-      if (this.isSettled()) this.updateDetail();
-    });
   }
   drawNew(pv, it) {
     const dark = isDarkColor(pv.page.paper);
@@ -686,21 +854,15 @@ export class Engine {
       pv.ctx.setTransform(pv.sx, 0, 0, pv.sy, 0, 0);
       drawItem(pv.ctx, it, dark, this.assets);
     } else this.requestRender();
-    if (this.detailOn) {
-      const d = this.detail, k = d.k, ctx = this.detailCtx;
-      ctx.setTransform(k, 0, 0, k, (pv.x - d.x) * k, (pv.y - d.y) * k);
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(0, 0, pv.page.w, pv.page.h);
-      ctx.clip();
-      drawItem(ctx, it, dark, this.assets);
-      ctx.restore();
+    for (const t of this.tilesOf(pv, it.bb)) {
+      t.ctx.setTransform(t.kx, 0, 0, t.ky, -t.x * t.kx, -t.y * t.ky);
+      drawItem(t.ctx, it, dark, this.assets);
     }
   }
   assetLoaded(id) {
-    for (const pv of this.pvs) if (pv.page.items.some((it) => it.t === 'i' && it.asset === id)) pv.dirty = true;
-    this.requestRender();
-    this.updateDetailSoon();
+    for (const pv of this.pvs) {
+      if (pv.page.bg === id || pv.page.items.some((it) => it.t === 'i' && it.asset === id)) this.invalidatePage(pv);
+    }
     if (this.sel && this.sel.items.some((it) => it.asset === id)) this.renderSelCanvas();
   }
 
@@ -812,7 +974,8 @@ export class Engine {
     if (a && a.pointerId === e.pointerId) return this.moveAction(a, e);
     if (this.mousePan && this.mousePan.id === e.pointerId) {
       const m = this.mousePan;
-      this.setView(m.v0.tx + e.clientX - m.x, m.v0.ty + e.clientY - m.y, m.v0.z);
+      const b = this.dragBounds(m.v0.z);
+      this.setView(rubber(m.v0.tx + e.clientX - m.x, b.minTx, b.maxTx, this.sw), rubber(m.v0.ty + e.clientY - m.y, b.minTy, b.maxTy, this.sh), m.v0.z);
       return;
     }
     if (!a) this.hover(e);
@@ -821,8 +984,9 @@ export class Engine {
     if (e.pointerType === 'touch') return this.touchUp(e, cancel);
     if (e.pointerType === 'pen') this.lastPenUp = now();
     if (this.mousePan && this.mousePan.id === e.pointerId) {
+      const from = this.mousePan.from;
       this.mousePan = null;
-      this.snapBack();
+      this.settleView({ from });
       return;
     }
     const a = this.action;
@@ -830,7 +994,7 @@ export class Engine {
   }
   beginMousePan(e) {
     this.stopAnim();
-    this.mousePan = { id: e.pointerId, x: e.clientX, y: e.clientY, v0: { ...this.view } };
+    this.mousePan = { id: e.pointerId, x: e.clientX, y: e.clientY, v0: { ...this.view }, from: this.focusIndex() };
     try { this.stage.setPointerCapture(e.pointerId); } catch (_) {}
   }
   onWheel(e) {
@@ -838,19 +1002,26 @@ export class Engine {
     e.preventDefault();
     this.stopAnim();
     const { tx, ty, z } = this.view;
+    if (!this._wheelFrom && this._wheelFrom !== 0) this._wheelFrom = this.focusIndex();
     if (e.ctrlKey || e.metaKey) {
       const sp = this.sp(e);
-      const nz = clamp(z * Math.exp(-e.deltaY * 0.01), MIN_Z, MAX_Z);
+      const pv = this.pvs[this.focusIndex()];
+      const nz = clamp(z * Math.exp(-e.deltaY * 0.01), pv ? this.minZoomFor(pv) : 0.1, MAX_Z);
       const w = this.toWorld(sp);
       this.setView(sp.x - w.x * nz, sp.y - w.y * nz, nz);
       this.hooks.onZoom && this.hooks.onZoom(nz);
     } else {
       const k = e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? this.sh : 1;
-      const b = this.bounds(z);
-      this.setView(clamp(tx - e.deltaX * k, b.minTx, b.maxTx), clamp(ty - e.deltaY * k, b.minTy, b.maxTy), z);
+      const dx = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX, dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
+      const b = this.dragBounds(z);
+      this.setView(clamp(tx - dx * k, b.minTx - 40, b.maxTx + 40), clamp(ty - dy * k, b.minTy - 40, b.maxTy + 40), z);
     }
     clearTimeout(this._wheelT);
-    this._wheelT = setTimeout(() => this.snapBack(), 220);
+    this._wheelT = setTimeout(() => {
+      const from = this._wheelFrom;
+      this._wheelFrom = null;
+      this.settleView({ from });
+    }, 200);
   }
 
   // ---------------------------------------------------------------- 指（パン・ピンチ・タップ）
@@ -864,7 +1035,7 @@ export class Engine {
     }
     const sp = this.sp(e);
     this.touches.set(e.pointerId, { id: e.pointerId, x: sp.x, y: sp.y, sx: sp.x, sy: sp.y });
-    if (!this.tapSess) this.tapSess = { t0: now(), max: 0, moved: false, drew: false, sp };
+    if (!this.tapSess) this.tapSess = { t0: now(), max: 0, moved: false, drew: false, sp, from: this.focusIndex() };
     this.tapSess.max = Math.max(this.tapSess.max, this.touches.size);
     this.stopAnim();
     if (this.touches.size === 1 && !this.action) {
@@ -901,6 +1072,7 @@ export class Engine {
       const c = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
       const d = Math.max(10, Math.hypot(a.x - b.x, a.y - b.y));
       this.tg = { mode: 'pinch', ids: [a.id, b.id], c0: c, d0: d, v0: v, w: { x: (c.x - v.tx) / v.z, y: (c.y - v.ty) / v.z } };
+      this.setPull(0);
     }
   }
   cancelTouchGesture() {
@@ -908,7 +1080,8 @@ export class Engine {
     this.tg = null;
     this.touches.clear();
     this.tapSess = null;
-    if (g && (g.mode === 'pan' || g.mode === 'pinch')) this.snapBack();
+    this.setPull(0);
+    if (g && (g.mode === 'pan' || g.mode === 'pinch')) this.settleView();
   }
   touchMove(e) {
     const t = this.touches.get(e.pointerId);
@@ -937,8 +1110,10 @@ export class Engine {
     }
     if (g.mode === 'pan') {
       if (t.id !== g.id) return;
-      const b = this.bounds(g.v0.z);
-      this.setView(rubber(g.v0.tx + t.x - g.p0.x, b.minTx, b.maxTx, this.sw), rubber(g.v0.ty + t.y - g.p0.y, b.minTy, b.maxTy, this.sh), g.v0.z);
+      const b = this.dragBounds(g.v0.z);
+      const rawTx = g.v0.tx + t.x - g.p0.x;
+      this.setView(rubber(rawTx, b.minTx, b.maxTx, this.sw), rubber(g.v0.ty + t.y - g.p0.y, b.minTy, b.maxTy, this.sh), g.v0.z);
+      this.setPull(rawTx < b.minTx && this.focusIndex() === this.pvs.length - 1 ? b.minTx - rawTx : 0);
       const tn = now();
       g.samples.push({ t: tn, x: t.x, y: t.y });
       while (g.samples.length > 2 && tn - g.samples[0].t > 90) g.samples.shift();
@@ -947,7 +1122,8 @@ export class Engine {
       if (!A || !B) return;
       const c = { x: (A.x + B.x) / 2, y: (A.y + B.y) / 2 };
       const d = Math.max(10, Math.hypot(A.x - B.x, A.y - B.y));
-      const z = softZoom((g.v0.z * d) / g.d0);
+      const pv = this.pvs[this.focusIndex()];
+      const z = softZoom((g.v0.z * d) / g.d0, pv ? this.minZoomFor(pv) : 0.1);
       this.lastPinchC = c;
       this.setView(c.x - g.w.x * z, c.y - g.w.y * z, z);
       this.hooks.onZoom && this.hooks.onZoom(z);
@@ -956,17 +1132,20 @@ export class Engine {
   touchUp(e, cancel) {
     const a = this.action;
     if (a && a.pointerId === e.pointerId) {
-      if (this.tapSess) this.tapSess.drew = a.kind === 'stroke' || a.kind === 'erase' || a.kind === 'lasso' || a.kind === 'sel';
+      if (this.tapSess) this.tapSess.drew = a.kind !== 'none' && a.kind !== 'text';
       this.endAction(a, e, cancel);
     }
     const t = this.touches.get(e.pointerId);
     if (!t) return;
     this.touches.delete(e.pointerId);
     const g = this.tg;
+    const from = this.tapSess ? this.tapSess.from : null;
     if (g) {
       if (this.touches.size === 0) {
         this.tg = null;
         if (g.mode === 'pan') {
+          const armed = this.pullArmed;
+          this.setPull(0);
           const s = g.samples;
           let vx = 0, vy = 0;
           if (s.length >= 2) {
@@ -977,10 +1156,17 @@ export class Engine {
               vy = (l.y - f.y) / dt;
             }
           }
-          if (Math.hypot(vx, vy) > 0.12) this.startInertia(vx, vy);
-          else this.snapBack();
+          const pv = this.pvs[from != null ? from : this.focusIndex()];
+          const fitsX = pv && pv.page.w * this.view.z <= this.area().w * 1.05;
+          if (armed && !cancel) {
+            this.hooks.onPullAdd && this.hooks.onPullAdd();
+          } else if (fitsX && Math.abs(vx) > 0.3 && Math.abs(vx) > Math.abs(vy) * 0.8) {
+            this.settleView({ vx, from });
+          } else if (Math.hypot(fitsX ? 0 : vx, vy) > 0.12) {
+            this.startInertia(fitsX ? 0 : vx, vy, from);
+          } else this.settleView({ from });
         } else if (g.mode === 'pinch') {
-          this.snapBack();
+          this.settleView();
           this.hooks.onZoomEnd && this.hooks.onZoomEnd();
         }
       } else this.rebaseGesture();
@@ -1037,32 +1223,32 @@ export class Engine {
         return;
       }
     }
+    const pv0 = this.pageAt(wp, 0);
     switch (this.tool) {
       case 'pen':
-      case 'hl': {
-        const pv = this.pageAt(wp, 0);
-        if (!pv) {
-          this.action = base;
-          return;
-        }
-        return this.beginStroke(base, pv, e);
-      }
+      case 'hl':
+        if (!pv0) break;
+        return this.beginStroke(base, pv0, e);
       case 'eraser':
         return this.beginErase(base, e);
       case 'lasso': {
         const pv = this.pageAt(wp, 40);
-        if (!pv) {
-          this.action = base;
-          return;
-        }
+        if (!pv) break;
         return this.beginLasso(base, pv, wp);
       }
+      case 'shape':
+        if (!pv0) break;
+        return this.beginShapeTool(base, pv0, e);
+      case 'stamp':
+        if (!pv0) break;
+        return this.beginStamp(base, pv0, e);
       case 'text':
         this.action = { ...base, kind: 'text', wp };
         return;
       default:
-        this.action = base;
+        break;
     }
+    this.action = base;
   }
   moveAction(a, e) {
     switch (a.kind) {
@@ -1070,6 +1256,8 @@ export class Engine {
       case 'erase': return this.moveErase(a, e);
       case 'lasso': return this.moveLasso(a, e);
       case 'sel': return this.moveSel(a, e);
+      case 'shapeTool': return this.moveShapeTool(a, e);
+      case 'stamp': return this.moveStamp(a, e);
       default: return undefined;
     }
   }
@@ -1080,6 +1268,8 @@ export class Engine {
       case 'erase': this.endErase(a); break;
       case 'lasso': this.endLasso(a, cancel); break;
       case 'sel': this.endSel(); break;
+      case 'shapeTool': this.endShapeTool(a, cancel); break;
+      case 'stamp': this.endStamp(a, cancel); break;
       case 'text':
         if (!cancel && e) {
           const sp = this.sp(e);
@@ -1095,6 +1285,7 @@ export class Engine {
     this.action = null;
     if (a.kind === 'stroke') {
       clearTimeout(a.holdT);
+      clearTimeout(a.predT);
       this.clearInk();
       this.clearFx();
       this.resetInkStyle();
@@ -1104,6 +1295,7 @@ export class Engine {
       cancelAnimationFrame(a.antsRaf);
       this.clearFx();
     } else if (a.kind === 'sel') this.endSel();
+    else if (a.kind === 'shapeTool' || a.kind === 'stamp') this.clearInk();
   }
 
   // ---------------------------------------------------------------- ペン・蛍光ペン
@@ -1129,7 +1321,8 @@ export class Engine {
     this.hideCursor();
     if (o.kind === 'hl' && o.straight) {
       const [x, y] = this.localPt(e, pv);
-      a.shape = { kind: 'line', pts: new Float32Array([x, y, o.w / 2, x + 0.01, y, o.w / 2]) };
+      const pts = new Float32Array([x, y, o.w / 2, x + 0.01, y, o.w / 2]);
+      a.shape = { kind: 'line', pts, base: Float32Array.from(pts) };
       this.drawLive(a, null);
       return;
     }
@@ -1146,14 +1339,9 @@ export class Engine {
   moveStroke(a, e) {
     const evs = coalesced(e);
     if (a.shape) {
-      if (a.shape.kind === 'line') {
-        const [x, y] = this.localPt(evs[evs.length - 1], a.pv);
-        const p = a.shape.pts;
-        const s = snapLineEnd(p[0], p[1], x, y);
-        p[3] = s[0];
-        p[4] = s[1];
-        this.drawLive(a, null);
-      }
+      const [x, y] = this.localPt(evs[evs.length - 1], a.pv);
+      this.adjustShape(a, x, y);
+      this.drawLive(a, null);
       return;
     }
     this.feed(a, evs);
@@ -1231,7 +1419,7 @@ export class Engine {
     let bb;
     if (a.shape) {
       const pts = a.shape.pts;
-      if (a.o.kind === 'hl') {
+      if (hl) {
         ctx.strokeStyle = a.o.color;
         ctx.lineWidth = a.o.w;
         ctx.lineCap = 'round';
@@ -1259,42 +1447,100 @@ export class Engine {
       // 描き直す範囲は「今のチャンク＋ペン先」だけ
       bb = live.cbb.slice();
       const lp = live.lastPoint();
-      const tipPts = lp ? [lp].concat(pred || []) : pred || [];
-      {
-        for (const q of tipPts) {
-          if (q[0] < bb[0]) bb[0] = q[0];
-          if (q[1] < bb[1]) bb[1] = q[1];
-          if (q[0] > bb[2]) bb[2] = q[0];
-          if (q[1] > bb[3]) bb[3] = q[1];
-        }
+      for (const q of lp ? [lp].concat(pred || []) : pred || []) {
+        if (q[0] < bb[0]) bb[0] = q[0];
+        if (q[1] < bb[1]) bb[1] = q[1];
+        if (q[0] > bb[2]) bb[2] = q[0];
+        if (q[1] > bb[3]) bb[3] = q[1];
       }
     }
     ctx.restore();
     this.inkDirty = this.devRect(pv, bb, a.o.w + 3);
   }
+
+  // ---- 長押しで図形に補正
   armHold(a, sp) {
     a.anchor = sp;
     clearTimeout(a.holdT);
-    a.holdT = setTimeout(() => this.onHold(a), 520);
+    a.holdT = setTimeout(() => this.onHold(a), HOLD_MS);
   }
   updateHold(a, sp) {
-    if (Math.hypot(sp.x - a.anchor.x, sp.y - a.anchor.y) > 5) this.armHold(a, sp);
+    if (Math.hypot(sp.x - a.anchor.x, sp.y - a.anchor.y) > 6) this.armHold(a, sp);
   }
   onHold(a) {
     if (this.action !== a || a.scribble || a.shape) return;
-    if (a.live.len * this.view.z < 24) return;
+    if (a.live.len * this.view.z < 20) return;
     const res = recognizeShape(a.live.allPoints(), this.view.z);
     if (!res) return;
-    a.shape = res;
+    const lp = a.live.lastPoint();
+    a.shape = { ...res, base: Float32Array.from(res.pts), hold: lp ? [lp[0], lp[1]] : null, th: 0 };
     this.drawLive(a, null);
     this.pulseAt(a.anchor);
     this.hooks.onShape && this.hooks.onShape(res.kind);
   }
-  checkScribble(a) {
+  // 補正後もペンを離さずに動かすと形を調整できる
+  adjustShape(a, x, y) {
+    const sh = a.shape, B = sh.base, P = sh.pts;
+    const n = B.length / 3;
+    switch (sh.kind) {
+      case 'line': {
+        const e = snapLineEnd(B[0], B[1], x, y);
+        P[3] = e[0];
+        P[4] = e[1];
+        break;
+      }
+      case 'polyline': {
+        // 最後の辺だけが、ひとつ前の角を中心に 360° 回る
+        const px = B[(n - 2) * 3], py = B[(n - 2) * 3 + 1];
+        const e = snapLineEnd(px, py, x, y);
+        P[(n - 1) * 3] = e[0];
+        P[(n - 1) * 3 + 1] = e[1];
+        break;
+      }
+      case 'arc':
+      case 'curve': {
+        // 始点を固定。始点に近い部分ほど動かず、ペン側ほど大きく回転・伸縮する
+        const sx = B[0], sy = B[1];
+        const v0x = B[(n - 1) * 3] - sx, v0y = B[(n - 1) * 3 + 1] - sy;
+        const v1x = x - sx, v1y = y - sy;
+        const L0 = Math.hypot(v0x, v0y), L1 = Math.hypot(v1x, v1y);
+        if (L0 < 1e-3 || L1 < 1e-3) break;
+        let th = Math.atan2(v1y, v1x) - Math.atan2(v0y, v0x);
+        while (th - sh.th > Math.PI) th -= Math.PI * 2;
+        while (th - sh.th < -Math.PI) th += Math.PI * 2;
+        sh.th = th;
+        const sc = L1 / L0;
+        for (let i = 0; i < n; i++) {
+          const t = sh.tt ? sh.tt[i] : i / (n - 1);
+          const ang = th * t, s = Math.pow(sc, t);
+          const c = Math.cos(ang), sn = Math.sin(ang);
+          const dx = B[i * 3] - sx, dy = B[i * 3 + 1] - sy;
+          P[i * 3] = sx + (dx * c - dy * sn) * s;
+          P[i * 3 + 1] = sy + (dx * sn + dy * c) * s;
+        }
+        break;
+      }
+      default: {
+        // 閉じた図形：中心からの距離に合わせて全体を拡大縮小（線の太さはそのまま）
+        if (!sh.center || !sh.hold) break;
+        const [cx, cy] = sh.center;
+        const d0 = Math.hypot(sh.hold[0] - cx, sh.hold[1] - cy), d1 = Math.hypot(x - cx, y - cy);
+        if (d0 < 1e-3) break;
+        const s = clamp(d1 / d0, 0.05, 40);
+        for (let i = 0; i < n; i++) {
+          P[i * 3] = cx + (B[i * 3] - cx) * s;
+          P[i * 3 + 1] = cy + (B[i * 3 + 1] - cy) * s;
+        }
+      }
+    }
+  }
+
+  // ---- ぐしゃぐしゃ消し
+  checkScribble(a, force) {
     const raw = a.live.raw;
     const n = raw.length >> 2;
     if (!a.scribble) {
-      if (n < 10 || n - a.scrN < 3) return;
+      if (!force && (n < 6 || n - a.scrN < 3)) return;
       a.scrN = n;
       if (!detectScribble(raw, this.view.z, settings.scribbleSens)) return;
       a.scribble = true;
@@ -1358,7 +1604,10 @@ export class Engine {
   }
   endStroke(a) {
     clearTimeout(a.holdT);
+    clearTimeout(a.predT);
     const pv = a.pv;
+    // 書き終わった時点でもう一度ぐしゃぐしゃ判定（途中で判定しきれなかった場合）
+    if (!a.scribble && !a.shape && settings.scribble && a.o.kind === 'pen') this.checkScribble(a, true);
     if (a.scribble && a.targets && a.targets.size) {
       const targets = [...a.targets];
       this.clearInk();
@@ -1380,7 +1629,7 @@ export class Engine {
       return;
     }
     const o = a.o;
-    const it = { id: uid(), t: 's', k: o.kind, c: o.color, w: o.w, pts: pts instanceof Float32Array ? pts : Float32Array.from(pts) };
+    const it = { id: uid(), t: 's', k: o.kind, c: o.color, w: o.w, pts: Float32Array.from(pts) };
     if (o.kind === 'hl') it.a = o.alpha;
     it.bb = computeBB(it.pts);
     if (!a.shape && a.live.dense.length > 3) setItemPath(it, a.live.fullPath());
@@ -1392,7 +1641,6 @@ export class Engine {
     this.resetInkStyle();
     this.markDirty(pv.page);
   }
-
   // ぐしゃぐしゃ消し：ほぼ覆われた線は丸ごと、通り抜けているだけの長い線は覆った部分だけ消す
   scribbleErase(pv, targets, raw) {
     const xy = [];
@@ -1411,7 +1659,7 @@ export class Engine {
       if (wholeSet.has(it)) continue;
       const frags = partial.get(it);
       if (frags) {
-        for (const f of frags) next.push({ ...it, id: uid(), pts: f, bb: computeBB(f) });
+        for (const f of frags) next.push({ ...it, id: uid(), pts: f, bb: computeBB(f), f: undefined, fa: undefined });
       } else next.push(it);
     }
     pv.page.items = next;
@@ -1422,6 +1670,132 @@ export class Engine {
     for (let i = 0; i < hull.length; i += 2) hp[i ? 'lineTo' : 'moveTo'](hull[i], hull[i + 1]);
     hp.closePath();
     this.dissolve(pv, targets, raw, new Set(partial.keys()), hp);
+  }
+
+  // ---------------------------------------------------------------- 図形ツール
+  shapeOpts() {
+    const t = settings.tools.shape;
+    return { kind: t.kind, color: t.colors[t.ci], w: t.widths[t.wi], fill: t.fill, square: t.square };
+  }
+  beginShapeTool(base, pv, e) {
+    const o = this.shapeOpts();
+    const [x, y] = this.localPt(e, pv);
+    this.action = { ...base, kind: 'shapeTool', pv, o, x0: x, y0: y, pts: null, closed: false };
+    this.resetInkStyle();
+    this.hideCursor();
+    this.drawShapeTool(this.action, x, y);
+  }
+  moveShapeTool(a, e) {
+    const evs = coalesced(e);
+    const [x, y] = this.localPt(evs[evs.length - 1], a.pv);
+    this.drawShapeTool(a, x, y);
+  }
+  drawShapeTool(a, x, y) {
+    const g = shapeGeometry(a.o.kind, a.x0, a.y0, x, y, { w: a.o.w, square: a.o.square });
+    const r = a.o.w / 2;
+    const pts = new Float32Array(g.V.length * 3);
+    g.V.forEach((p, i) => {
+      pts[i * 3] = p[0];
+      pts[i * 3 + 1] = p[1];
+      pts[i * 3 + 2] = r;
+    });
+    a.pts = pts;
+    a.closed = g.closed;
+    this.clearInk();
+    const ctx = this.inkCtx, pv = a.pv;
+    const [k, ox, oy] = this.inkTransform(pv);
+    ctx.setTransform(k, 0, 0, k, ox, oy);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, pv.page.w, pv.page.h);
+    ctx.clip();
+    if (a.closed && a.o.fill !== 'none') {
+      ctx.globalAlpha = a.o.fill === 'solid' ? 1 : 0.2;
+      ctx.fillStyle = a.o.color;
+      ctx.fill(polyPath(pts));
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = a.o.color;
+    ctx.fill(buildInkPath(pts));
+    ctx.restore();
+    this.inkDirty = this.devRect(pv, computeBB(pts), 4);
+  }
+  endShapeTool(a, cancel) {
+    const pts = a.pts;
+    this.clearInk();
+    if (cancel || !pts) return;
+    const bb = computeBB(pts);
+    const z = this.view.z;
+    if ((bb[2] - bb[0]) * z < 6 && (bb[3] - bb[1]) * z < 6) return;
+    const pv = a.pv;
+    const it = { id: uid(), t: 's', k: 'pen', c: a.o.color, w: a.o.w, pts, bb };
+    if (a.closed && a.o.fill !== 'none') {
+      it.f = a.o.color;
+      it.fa = a.o.fill === 'solid' ? 1 : 0.2;
+    }
+    this.beginEdit(pv);
+    pv.page.items.push(it);
+    this.commitEdits();
+    this.drawNew(pv, it);
+    this.markDirty(pv.page);
+  }
+
+  // ---------------------------------------------------------------- スタンプ
+  beginStamp(base, pv, e) {
+    const st = this.hooks.getStamp && this.hooks.getStamp();
+    if (!st) {
+      this.action = base;
+      this.hooks.onNoStamp && this.hooks.onNoStamp();
+      return;
+    }
+    const [x, y] = this.localPt(e, pv);
+    this.action = { ...base, kind: 'stamp', pv, st, x, y };
+    this.resetInkStyle();
+    this.hideCursor();
+    this.drawStampPreview(this.action);
+  }
+  moveStamp(a, e) {
+    const evs = coalesced(e);
+    [a.x, a.y] = this.localPt(evs[evs.length - 1], a.pv);
+    this.drawStampPreview(a);
+  }
+  drawStampPreview(a) {
+    this.clearInk();
+    const st = a.st, sc = st.scale || 1, pv = a.pv;
+    const ctx = this.inkCtx;
+    const [k, ox, oy] = this.inkTransform(pv);
+    ctx.setTransform(k, 0, 0, k, ox, oy);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, pv.page.w, pv.page.h);
+    ctx.clip();
+    ctx.translate(a.x, a.y);
+    ctx.scale(sc, sc);
+    ctx.globalAlpha = 0.8;
+    const dark = isDarkColor(pv.page.paper);
+    for (const it of st.items) drawItem(ctx, it, dark, st.assets);
+    ctx.restore();
+    const b = st.bb;
+    this.inkDirty = this.devRect(pv, [a.x + b[0] * sc, a.y + b[1] * sc, a.x + b[2] * sc, a.y + b[3] * sc], 4);
+  }
+  async endStamp(a, cancel) {
+    this.clearInk();
+    if (cancel) return;
+    const st = a.st, sc = st.scale || 1, pv = a.pv;
+    const amap = new Map();
+    for (const [id, entry] of st.assets) {
+      if (!this.hooks.importStampAsset) continue;
+      const nid = await this.hooks.importStampAsset(id, entry);
+      if (nid) amap.set(id, nid);
+    }
+    if (!this.pvMap.has(pv.page)) return;
+    const items = st.items.map((it) => transformItem(cloneItem(it, amap), 0, 0, { tx: a.x, ty: a.y, s: sc, r: 0 }));
+    this.beginEdit(pv);
+    pv.page.items.push(...items);
+    this.commitEdits();
+    for (const it of items) this.drawNew(pv, it);
+    this.markDirty(pv.page);
+    this.pulseAt({ x: (pv.x + a.x) * this.view.z + this.view.tx, y: (pv.y + a.y) * this.view.z + this.view.ty });
   }
 
   // ---------------------------------------------------------------- 消しゴム
@@ -1474,7 +1848,7 @@ export class Engine {
         const frags = splitStroke(it, x, y, R);
         if (frags === null) continue;
         this.beginEdit(pv);
-        items.splice(i, 1, ...frags.map((f) => ({ ...it, id: uid(), pts: f, bb: computeBB(f) })));
+        items.splice(i, 1, ...frags.map((f) => ({ ...it, id: uid(), pts: f, bb: computeBB(f), f: undefined, fa: undefined })));
       }
       const d = a.dirty.get(pv);
       const b = it.bb;
@@ -1573,7 +1947,7 @@ export class Engine {
       const its = pv.page.items;
       for (let i = its.length - 1; i >= 0; i--) {
         const it = its[i];
-        if (it.t === 's' ? hitStrokeCircle(it, x, y, 7 / z) : hitBox(it, x, y, 4 / z)) {
+        if (it.t === 's' ? hitStrokeCircle(it, x, y, 7 / z) || (it.f && pointInPoly(x, y, Array.from(it.pts).filter((_, k) => k % 3 !== 2))) : hitBox(it, x, y, 4 / z)) {
           items = [it];
           break;
         }
@@ -1671,6 +2045,7 @@ export class Engine {
         btn('copy', 'コピー', () => this.copySel()),
         btn('cut', 'カット', () => this.cutSel()),
         btn('duplicate', '複製', () => this.duplicateSel()),
+        btn('stamp', 'スタンプ', () => this.hooks.onSelStamp && this.hooks.onSelStamp()),
         btn('more', 'その他', (b) => this.hooks.onSelMore && this.hooks.onSelMore(b)),
         btn('trash', '削除', () => this.deleteSel(), 'danger'),
       ].filter(Boolean)
@@ -1704,7 +2079,7 @@ export class Engine {
     const c = Math.abs(Math.cos(g.r)), s = Math.abs(Math.sin(g.r));
     const ey = (s * g.w + c * g.h) / 2;
     const ms = this.selMenuSize;
-    const mw = ms.w || 320, mh = ms.h || 50;
+    const mw = ms.w || 360, mh = ms.h || 50;
     let top = g.scy - ey - 46 - mh;
     if (top < this.insets.top + 8) top = g.scy + ey + 14;
     if (top + mh > this.sh - this.insets.bottom - 8) top = clamp(g.scy - mh / 2, this.insets.top + 8, this.sh - mh - 8);
@@ -1861,7 +2236,11 @@ export class Engine {
     if (!s) return;
     const map = new Map();
     const items = s.items.map((it) => {
-      const n = it.t === 's' || it.t === 'x' ? { ...it, c: color } : it;
+      let n = it;
+      if (it.t === 's' || it.t === 'x') {
+        n = { ...it, c: color };
+        if (it.f) n.f = color;
+      }
       map.set(it, n);
       return n;
     });
@@ -1886,18 +2265,21 @@ export class Engine {
     s.items = clones;
     s.pv.hidden = new Set(clones);
   }
-  selectionCanvas(scale = 2) {
+  selectionCanvas(scale = 2, transparent = false) {
     const s = this.sel;
     if (!s) return null;
     const pad = 12;
     const x = s.bb[0] - pad, y = s.bb[1] - pad, w = s.bb[2] - s.bb[0] + pad * 2, hh = s.bb[3] - s.bb[1] + pad * 2;
+    const sc = Math.min(scale, Math.sqrt(12e6 / (w * hh)));
     const cv = document.createElement('canvas');
-    cv.width = Math.ceil(w * scale);
-    cv.height = Math.ceil(hh * scale);
+    cv.width = Math.max(1, Math.ceil(w * sc));
+    cv.height = Math.max(1, Math.ceil(hh * sc));
     const ctx = cv.getContext('2d');
-    ctx.fillStyle = s.pv.page.paper;
-    ctx.fillRect(0, 0, cv.width, cv.height);
-    ctx.setTransform(scale, 0, 0, scale, -x * scale, -y * scale);
+    if (!transparent) {
+      ctx.fillStyle = s.pv.page.paper;
+      ctx.fillRect(0, 0, cv.width, cv.height);
+    }
+    ctx.setTransform(sc, 0, 0, sc, -x * sc, -y * sc);
     const dark = isDarkColor(s.pv.page.paper);
     for (const it of s.items) drawItem(ctx, it, dark, this.assets);
     return cv;
@@ -1940,21 +2322,11 @@ export class Engine {
     return true;
   }
   centerPage() {
-    const c = this.toWorld({ x: this.sw / 2, y: (this.insets.top + this.sh - this.insets.bottom) / 2 });
-    let best = null, bd = Infinity;
-    for (const pv of this.pvs) {
-      const dx = Math.max(pv.x - c.x, 0, c.x - (pv.x + pv.page.w));
-      const dy = Math.max(pv.y - c.y, 0, c.y - (pv.y + pv.page.h));
-      const d = dx + dy;
-      if (d < bd) {
-        bd = d;
-        best = pv;
-      }
-    }
-    return best;
+    return this.pvs[this.focusIndex()] || null;
   }
   viewCenterLocal(pv) {
-    const c = this.toWorld({ x: this.sw / 2, y: (this.insets.top + this.sh - this.insets.bottom) / 2 });
+    const A = this.area();
+    const c = this.toWorld({ x: (A.l + A.r) / 2, y: (A.t + A.b) / 2 });
     return { x: clamp(c.x - pv.x, 60, pv.page.w - 60), y: clamp(c.y - pv.y, 60, pv.page.h - 60) };
   }
   insertImage(assetId, w, hgt) {
@@ -2162,18 +2534,17 @@ export class Engine {
       if (focus && isFinite(focus.bb[0])) this.ensureVisible(focus.pv, focus.bb);
     } else if (c.type === 'pages') {
       this.setPages(undo ? c.before : c.after);
-      this.clampNow();
+      this.settleView();
     } else if (c.type === 'props') {
       for (const e of c.entries) {
         Object.assign(e.page, undo ? e.before : e.after);
         const pv = this.pvMap.get(e.page);
-        if (pv) pv.dirty = true;
+        if (pv) this.invalidatePage(pv);
         this.markDirty(e.page);
       }
       this.layout();
-      this.clampNow();
+      this.settleView({ instant: true });
       this.requestRender();
-      this.updateDetailSoon();
     }
   }
   markDirty(page) {
@@ -2195,36 +2566,43 @@ export class Engine {
     if (this.textEdit && !keep.has(this.textEdit.pv.page)) this.commitText();
     for (const pv of this.pvs) {
       if (keep.has(pv.page)) continue;
+      this.dropTiles(pv);
       pv.cv.width = 0;
       pv.cv.height = 0;
       pv.el.remove();
       this.pvMap.delete(pv.page);
     }
     this.pvs = pages.map((p) => this.pvMap.get(p) || this.createPV(p));
-    for (const pv of this.pvs) this.world.insertBefore(pv.el, this.detailCv);
+    for (const pv of this.pvs) this.world.insertBefore(pv.el, this.ghost);
     this.layout();
     this.updateVisibility();
     this.requestRender();
-    this.updateDetailSoon();
     if (this.sel) this.updateSelUi();
     this.hooks.onPages && this.hooks.onPages(this.pages());
   }
   addPage(index, props = {}) {
+    return this.addPages(index, [props])[0];
+  }
+  addPages(index, list) {
     this.finishTransient();
     const before = this.pages();
     const ref = before[clamp(index - 1, 0, before.length - 1)] || {};
-    const page = newPageData(this.note.id, {
-      template: props.template ?? ref.template,
-      paper: props.paper ?? ref.paper,
-      w: props.w ?? ref.w,
-      h: props.h ?? ref.h,
+    const pages = list.map((props) => {
+      const p = newPageData(this.note.id, {
+        template: props.template ?? ref.template,
+        paper: props.paper ?? ref.paper,
+        w: props.w ?? ref.w,
+        h: props.h ?? ref.h,
+        bg: props.bg || null,
+      });
+      return p;
     });
     const after = before.slice();
-    after.splice(index, 0, page);
+    after.splice(index, 0, ...pages);
     this.pushCmd({ type: 'pages', before, after });
     this.setPages(after);
-    this.markDirty(page);
-    return page;
+    for (const p of pages) this.markDirty(p);
+    return pages;
   }
   deletePage(index) {
     const before = this.pages();
@@ -2234,7 +2612,7 @@ export class Engine {
     after.splice(index, 1);
     this.pushCmd({ type: 'pages', before, after });
     this.setPages(after);
-    this.clampNow();
+    this.settleView();
     return true;
   }
   duplicatePage(index) {
@@ -2279,9 +2657,7 @@ export class Engine {
     this.beginEdit(pv);
     pv.page.items = [];
     this.commitEdits();
-    pv.dirty = true;
-    this.requestRender();
-    this.updateDetailSoon();
+    this.invalidatePage(pv);
     this.markDirty(pv.page);
   }
 

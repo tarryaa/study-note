@@ -1,6 +1,6 @@
 // IndexedDB ラッパー（iOS の接続切れに備えて自動再接続）
 const NAME = 'benkyo-note';
-const VERSION = 1;
+const VERSION = 2;
 let _db = null;
 let _opening = null;
 
@@ -16,6 +16,7 @@ function open() {
       if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages', { keyPath: 'id' }).createIndex('noteId', 'noteId');
       if (!db.objectStoreNames.contains('assets')) db.createObjectStore('assets', { keyPath: 'id' }).createIndex('noteId', 'noteId');
       if (!db.objectStoreNames.contains('thumbs')) db.createObjectStore('thumbs', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('stamps')) db.createObjectStore('stamps', { keyPath: 'id' });
     };
     req.onsuccess = () => {
       _db = req.result;
@@ -91,6 +92,6 @@ export function batch(ops) {
   });
 }
 export function clearAll() {
-  const stores = ['folders', 'notes', 'pages', 'assets', 'thumbs'];
+  const stores = ['folders', 'notes', 'pages', 'assets', 'thumbs', 'stamps'];
   return run(stores, 'readwrite', (tx) => { for (const s of stores) tx.objectStore(s).clear(); });
 }

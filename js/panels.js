@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -56,6 +56,11 @@ export function openSettings(app) {
       ui.row('ツールバーの位置', ui.segmented([{ value: 'top', label: '上' }, { value: 'bottom', label: '下' }, { value: 'left', label: '左' }, { value: 'right', label: '右' }], settings.dockPos, (v) => app.editor.setDockPos(v, false)), 'エディタでつまみをドラッグしても変えられます')
     ),
     ui.section(
+      'ズーム',
+      ui.row('縮小したときの余白（上・左右）', ui.slider({ min: 0.3, max: 2.5, step: 0.05, value: settings.zoomMargin, format: (v) => v.toFixed(2) + '×', onInput: (v) => { settings.zoomMargin = v; saveSettings(); app.editor.engine.settleView(); } }), 'いちばん縮小したとき、ページのまわりに空ける幅（ツールバーの高さの何倍か）'),
+      ui.row('縮小したときの余白（下）', ui.slider({ min: 0.2, max: 2.5, step: 0.05, value: settings.zoomMarginBottom, format: (v) => v.toFixed(2) + '×', onInput: (v) => { settings.zoomMarginBottom = v; saveSettings(); app.editor.engine.settleView(); } }))
+    ),
+    ui.section(
       '手書き',
       ui.row('予測描画', ui.toggle(settings.prediction, set('prediction')), 'ペン先の少し先まで線を描いて、遅れを感じにくくします'),
       ui.row('指で描く', ui.segmented([{ value: 'auto', label: '自動' }, { value: 'on', label: 'オン' }, { value: 'off', label: 'オフ' }], settings.fingerDraw, (v) => { set('fingerDraw')(v); app.editor.updateFinger(); }), '自動：Apple Pencil を使うと、指はスクロールとズーム専用になります'),
@@ -91,10 +96,14 @@ export function openSettings(app) {
 
 const GESTURES = [
   ['pen', 'Apple Pencil で書く', '筆圧で太さが変わります。指はスクロール・ズーム用（ヘッダーの手のボタンで切替）'],
-  ['sparkle', 'ぐしゃぐしゃっと消す', 'ペンのまま、消したい所を塗りつぶすように往復すると線が消えます'],
-  ['shapes', '止めると図形に', '線・円・四角・三角を描いてペンを止めると、きれいな図形に補正。直線は止めた後も向きを調整できます'],
+  ['sparkle', 'ぐしゃぐしゃっと消す', 'ペンのまま、消したい所を塗りつぶすように往復すると線が消えます。下を通る長い線は覆った部分だけ消えます'],
+  ['shapes', '止めると図形に', '直線・弧・曲線・折れ線・円・四角・三角を描いてペンを止めると整います。そのまま動かすと大きさや向きを調整できます'],
+  ['shapes', '図形ツール', 'ツールバーの図形から、矢印・星・多角形などをドラッグで描けます。塗りや縦横比固定も選べます'],
+  ['pages', 'ページは横に並ぶ', '左右にスワイプでページ移動。最後のページでさらに左へ引っ張ると新しいページが追加されます'],
+  ['stamp', 'スタンプ', 'なげなわで囲んで「スタンプ」で保存。スタンプツールでタップするとすぐに貼れます'],
+  ['img-page', '画像からページ', 'ページ追加やノート作成で「画像から」を選ぶと、写真やプリントをそのままページにできます'],
   ['undo', '2 本指タップで元に戻す', '3 本指タップでやり直し。⌘Z / ⇧⌘Z も使えます'],
-  ['zoom', 'ピンチでズーム', '2 本指でズーム・移動。指でダブルタップすると拡大／戻す'],
+  ['zoom', 'ピンチでズーム', '縮小はページ全体が見えるところまで。指を離すとページの見やすい位置に自動で戻ります'],
   ['lasso', 'なげなわで編集', '囲んで移動・拡大縮小・回転・色変更・コピー。他のページへのドラッグもOK'],
   ['folder-move', '長押しでドラッグ整理', 'ノートやフォルダを長押しして、サイドバーのフォルダへドラッグ'],
   ['dock', 'ツールバーは自由に移動', 'つまみ（⋮⋮）をドラッグして上下左右に配置。ツールを再タップで詳細設定'],

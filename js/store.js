@@ -136,8 +136,10 @@ export async function deleteFolder(id) {
 }
 
 // ---------- ノート ----------
-export function newPageData(noteId, { template = 'blank', paper = '#ffffff', w = 794, h = 1123 } = {}) {
-  return { id: uid(), noteId, w, h, template, paper, items: [] };
+export function newPageData(noteId, { template = 'blank', paper = '#ffffff', w = 794, h = 1123, bg = null } = {}) {
+  const p = { id: uid(), noteId, w, h, template, paper, items: [] };
+  if (bg) p.bg = bg; // 画像から作ったページ（背景画像のアセット ID）
+  return p;
 }
 
 export async function createNote(opts = {}) {
@@ -156,10 +158,17 @@ export async function createNote(opts = {}) {
     pageIds: [],
     defaults: { template: opts.template || 'ruled7', paper: opts.paper || '#ffffff', size: opts.size || 'a4p' },
   };
-  const page = newPageData(note.id, { template: note.defaults.template, paper: note.defaults.paper, w: size.w, h: size.h });
-  note.pageIds = [page.id];
+  // opts.pageSpecs があればそのページで作る（画像から作るノートなど）
+  const pages = (opts.pageSpecs && opts.pageSpecs.length ? opts.pageSpecs : [{ template: note.defaults.template, paper: note.defaults.paper, w: size.w, h: size.h }])
+    .map((s) => newPageData(note.id, s));
+  const assets = (opts.assets || []).map((a) => ({ ...a, noteId: note.id }));
+  note.pageIds = pages.map((p) => p.id);
   state.notes.push(note);
-  await db.batch([{ store: 'notes', put: note }, { store: 'pages', put: page }]);
+  await db.batch([
+    { store: 'notes', put: note },
+    ...pages.map((p) => ({ store: 'pages', put: p })),
+    ...assets.map((a) => ({ store: 'assets', put: a })),
+  ]);
   emit('notes');
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   return note;
@@ -221,7 +230,11 @@ export async function duplicateNote(id) {
     amap.set(a.id, nid);
     return { ...a, id: nid, noteId: note.id };
   });
-  const newPages = pages.map((p) => ({ ...p, id: uid(), noteId: note.id, items: p.items.map((it) => cloneItem(it, amap)) }));
+  const newPages = pages.map((p) => {
+    const np = { ...p, id: uid(), noteId: note.id, items: p.items.map((it) => cloneItem(it, amap)) };
+    if (p.bg && amap.has(p.bg)) np.bg = amap.get(p.bg);
+    return np;
+  });
   note.pageIds = newPages.map((p) => p.id);
   state.notes.push(note);
   await db.batch([
@@ -280,3 +293,12 @@ export const getThumb = (noteId) => db.get('thumbs', noteId);
 export function notifyNotes() {
   emit('notes');
 }
+
+// ---------- スタンプ（全ノート共通） ----------
+export async function loadStamps() {
+  const list = (await db.getAll('stamps')) || [];
+  for (const s of list) for (const it of s.items || []) if (it.pts && !(it.pts instanceof Float32Array)) it.pts = Float32Array.from(it.pts);
+  return list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+export const saveStamp = (s) => db.put('stamps', s);
+export const deleteStamp = (id) => db.del('stamps', id);

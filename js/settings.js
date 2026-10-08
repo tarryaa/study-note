@@ -24,6 +24,8 @@ export const DEFAULTS = {
   prediction: true,
   twoFingerUndo: true,
   autoRevert: false,
+  zoomMargin: 1.3, // いちばん縮小したときのページまわりの余白（ツールバーの高さの何倍か）
+  zoomMarginBottom: 0.6,
   libSort: 'updated',
   libView: 'grid',
   newNote: { template: 'ruled7', paper: '#ffffff', size: 'a4p', cover: 'indigo' },
@@ -32,6 +34,8 @@ export const DEFAULTS = {
     hl: { colors: ['#ffd60a', '#7ee0a1', '#ff9ec7', '#8cc8ff'], ci: 0, widths: [10, 16, 26], wi: 1, alpha: 0.38, straight: false },
     eraser: { mode: 'partial', sizes: [10, 24, 48], si: 1, hlOnly: false },
     lasso: { mode: 'free' },
+    shape: { kind: 'rect', colors: ['#1d1d1f', '#1f5fd1', '#e5484d', '#1f8a4c'], ci: 0, widths: [1.5, 2.5, 4.5], wi: 1, fill: 'none', square: false },
+    stamp: { id: null, scale: 1 },
     text: { colors: ['#1d1d1f', '#1f5fd1', '#e5484d', '#1f8a4c'], ci: 0, sizes: [14, 20, 30], si: 1 },
   },
   tool: 'pen',

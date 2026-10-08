@@ -208,8 +208,29 @@ function drawImageItem(ctx, it, assets) {
   ctx.restore();
 }
 
+const fillCache = new WeakMap();
+function fillPath(it) {
+  let p = fillCache.get(it);
+  if (!p) {
+    p = new Path2D();
+    const s = it.pts;
+    for (let i = 0; i < s.length; i += 3) p[i ? 'lineTo' : 'moveTo'](s[i], s[i + 1]);
+    p.closePath();
+    fillCache.set(it, p);
+  }
+  return p;
+}
+
 export function drawItem(ctx, it, dark, assets) {
   if (it.t === 's') {
+    if (it.f) {
+      // 図形ツールの塗りつぶし
+      ctx.save();
+      ctx.globalAlpha = it.fa == null ? 1 : it.fa;
+      ctx.fillStyle = it.f;
+      ctx.fill(fillPath(it));
+      ctx.restore();
+    }
     if (it.k === 'hl') {
       ctx.save();
       ctx.globalAlpha = it.a == null ? 0.38 : it.a;
@@ -243,6 +264,13 @@ export function drawItems(ctx, page, opts = {}) {
   }
 }
 
+// 画像から作ったページの背景
+function drawBg(ctx, page, assets) {
+  if (!page.bg) return;
+  const a = assets && assets.get(page.bg);
+  if (a && a.ok) ctx.drawImage(a.img, 0, 0, page.w, page.h);
+}
+
 // ページ全体（ctx の変換は呼び出し側で設定しない。sx, sy で拡大）
 export function renderPageTo(ctx, page, sx, sy, opts = {}) {
   ctx.setTransform(sx, 0, 0, sy, 0, 0);
@@ -250,6 +278,7 @@ export function renderPageTo(ctx, page, sx, sy, opts = {}) {
   ctx.globalCompositeOperation = 'source-over';
   ctx.fillStyle = page.paper;
   ctx.fillRect(0, 0, page.w, page.h);
+  drawBg(ctx, page, opts.assets);
   drawTemplate(ctx, page, sx);
   drawItems(ctx, page, opts);
 }
@@ -262,6 +291,7 @@ export function renderRegion(ctx, page, r, scale, opts = {}) {
   ctx.clip();
   ctx.fillStyle = page.paper;
   ctx.fillRect(r.x, r.y, r.w, r.h);
+  drawBg(ctx, page, opts.assets);
   drawTemplate(ctx, page, scale, r);
   drawItems(ctx, page, { ...opts, rect: r });
   ctx.restore();

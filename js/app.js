@@ -222,6 +222,7 @@ class App {
     const dismiss = ui.toast('読み込み中…', { duration: 60000, icon: 'upload' });
     try {
       const r = await exporter.importBackup(file);
+      this.editor.stampsLoaded = false;
       dismiss();
       ui.toast(`${r.notes} 冊のノートを読み込みました`, { icon: 'check' });
       this.library.render(true);

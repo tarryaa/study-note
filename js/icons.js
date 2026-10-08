@@ -71,6 +71,9 @@ const P = {
   database: '<ellipse cx="12" cy="6.5" rx="7" ry="2.8"/><path d="M5 6.5v11c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8v-11M5 12c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8"/>',
   pin: '<path d="M9 4.5h6l-1 5 3 3v1.5H7V12.5l3-3z"/><path d="M12 14v6"/>',
   dock: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M7.5 8h9" stroke-width="3"/>',
+  stamp: '<path d="M9.6 4h4.8a1.6 1.6 0 0 1 1.6 1.6c0 2.6-2.1 3.6-2.1 6.2h-3.8c0-2.6-2.1-3.6-2.1-6.2A1.6 1.6 0 0 1 9.6 4z"/><path d="M5.2 11.8h13.6a1.2 1.2 0 0 1 1.2 1.2v2.7H4V13a1.2 1.2 0 0 1 1.2-1.2z"/><path d="M5.5 19.5h13"/>',
+  'zoom-out': '<circle cx="11" cy="11" r="6.2"/><path d="m15.6 15.6 4.4 4.4M8.5 11h5"/>',
+  'img-page': '<rect x="5" y="3.5" width="14" height="17" rx="2.2"/><circle cx="10" cy="9" r="1.6"/><path d="m19 15.5-4-4-7 7.5"/>',
 };
 
 export function icon(name, cls = '') {

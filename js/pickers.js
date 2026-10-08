@@ -1,10 +1,13 @@
 // テンプレート・紙の色・サイズ・表紙色の選択 UI
 import { h } from './util.js';
+import { icon } from './icons.js';
 import { TEMPLATES, PAPERS, PAGE_SIZES, COVERS, FOLDER_COLORS } from './store.js';
 import { drawTemplate } from './render.js';
 
-export function templateGrid(state, onChange) {
+// opts.onImage を渡すと「画像から」タイルを出す（state.template === 'image' で選択状態）
+export function templateGrid(state, onChange, opts = {}) {
   const grid = h('div', { class: 'tpl-grid' });
+  let imgBtn = null, imgLabel = null;
   const items = TEMPLATES.map((t) => {
     const cv = h('canvas', { class: 'tpl-cv' });
     const b = h('button', { class: 'tpl', type: 'button' }, h('span', { class: 'tpl-paper' }, cv), h('span', { class: 'tpl-label', text: t.label }));
@@ -33,12 +36,24 @@ export function templateGrid(state, onChange) {
       drawTemplate(ctx, { w: 794, h: 1123, template: t.id, paper: state.paper }, s);
     }
   }
+  if (opts.onImage) {
+    imgLabel = h('span', { class: 'tpl-label', text: '画像から' });
+    imgBtn = h('button', { class: 'tpl tpl-img', type: 'button' }, h('span', { class: 'tpl-paper img', html: icon('img-page') }), imgLabel);
+    imgBtn.addEventListener('click', () => opts.onImage());
+    grid.append(imgBtn);
+  }
   function sync() {
     for (const { t, b } of items) b.classList.toggle('on', t.id === state.template);
+    if (imgBtn) {
+      imgBtn.classList.toggle('on', state.template === 'image');
+      const n = state.images ? state.images.length : 0;
+      imgLabel.textContent = n ? `画像 ${n}枚` : '画像から';
+    }
   }
   draw();
   sync();
   grid.redraw = draw;
+  grid.sync = sync;
   return grid;
 }
 

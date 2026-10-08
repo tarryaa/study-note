@@ -6,6 +6,7 @@ import * as store from './store.js';
 import * as ui from './ui.js';
 import { templateGrid, paperSwatches, sizeChips, coverSwatches, folderSwatches } from './pickers.js';
 import { renderThumb } from './render.js';
+import { imagesToPageSpecs, loadAssetEntry } from './editor.js';
 
 const SORTS = [
   { id: 'updated', label: '更新日が新しい順' },
@@ -514,8 +515,7 @@ export class Library {
           const pages = await store.loadPages(id);
           const assets = await store.loadAssets(id);
           const map = new Map();
-          const { loadAssetEntry } = await import('./editor.js');
-          for (const a of assets) if (pages[0].items.some((it) => it.asset === a.id)) map.set(a.id, await loadAssetEntry(a).ready);
+          for (const a of assets) if (pages[0].bg === a.id || pages[0].items.some((it) => it.asset === a.id)) map.set(a.id, await loadAssetEntry(a).ready);
           const cv = renderThumb(pages[0], 360, map);
           await store.setThumb(id, await canvasToBlob(cv, 'image/jpeg', 0.85));
           for (const e of map.values()) URL.revokeObjectURL(e.url);
@@ -922,33 +922,80 @@ export class Library {
     });
   }
   newNote(folderId) {
-    const st = { ...settings.newNote };
+    const st = { ...settings.newNote, images: null };
+    if (st.template === 'image') st.template = 'ruled7';
     const title = h('input', { class: 'input big', placeholder: '無題のノート', enterkeyhint: 'done', autocomplete: 'off' });
     const coverPrev = h('div', { class: 'nn-cover' }, h('span', { class: 'nc-spine' }), h('div', { class: 'nn-paper' }));
     const upd = () => {
       coverPrev.style.setProperty('--cover', store.coverColor(st.cover));
       coverPrev.querySelector('.nn-paper').style.background = st.paper;
     };
-    const tg = templateGrid(st);
+    // 「画像から」：選んだ画像 1 枚ごとに、その縦横比のページを作る
+    const fileIn = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true });
+    const sizeBox = h('div', {}, h('h4', { text: 'サイズ' }), sizeChips(st));
+    const imgHint = h('p', { class: 'tp-hint', html: `${icon('img-page')}<span>選んだ画像がそのままページになります（縦横比は画像に合わせます）</span>` });
+    const sync = () => {
+      sizeBox.hidden = st.template === 'image';
+      imgHint.hidden = st.template !== 'image';
+    };
+    const tg = templateGrid(
+      st,
+      () => {
+        st.images = null;
+        tg.sync();
+        sync();
+      },
+      { onImage: () => fileIn.click() }
+    );
+    fileIn.addEventListener('change', () => {
+      const files = [...(fileIn.files || [])];
+      fileIn.value = '';
+      if (!files.length) return;
+      st.images = files;
+      st.template = 'image';
+      tg.sync();
+      sync();
+    });
     const body = h(
       'div',
       { class: 'nn-body' },
       h('div', { class: 'nn-top' }, coverPrev, h('div', { class: 'nn-fields' }, title, h('h4', { text: '表紙の色' }), coverSwatches(st, upd))),
       h('h4', { text: 'テンプレート' }),
       tg,
-      h('div', { class: 'nn-2col' }, h('div', {}, h('h4', { text: '紙の色' }), paperSwatches(st, () => { tg.redraw(); upd(); })), h('div', {}, h('h4', { text: 'サイズ' }), sizeChips(st)))
+      imgHint,
+      h('div', { class: 'nn-2col' }, h('div', {}, h('h4', { text: '紙の色' }), paperSwatches(st, () => { tg.redraw(); upd(); })), sizeBox),
+      fileIn
     );
     upd();
+    sync();
     const f = folderId && store.getFolder(folderId);
     const okBtn = h('button', { class: 'btn primary', html: `${icon('sparkle')}<span>作成して開く</span>` });
     const cancel = h('button', { class: 'btn', text: 'キャンセル' });
     const s = ui.sheet({ title: f ? `新しいノート（${f.name}）` : '新しいノート', body, foot: [cancel, okBtn], className: 'wide' });
     cancel.addEventListener('click', () => s.close());
     const submit = async () => {
+      if (okBtn.disabled) return;
+      const useImages = st.template === 'image' && st.images && st.images.length;
+      if (st.template === 'image' && !useImages) {
+        fileIn.click();
+        return;
+      }
       okBtn.disabled = true;
-      settings.newNote = { template: st.template, paper: st.paper, size: st.size, cover: st.cover };
+      settings.newNote = { template: useImages ? settings.newNote.template : st.template, paper: st.paper, size: st.size, cover: st.cover };
       saveSettings();
-      const note = await store.createNote({ title: title.value, folderId, cover: st.cover, template: st.template, paper: st.paper, size: st.size });
+      let extra = {};
+      if (useImages) {
+        okBtn.innerHTML = `${icon('img-page')}<span>読み込み中…</span>`;
+        const { specs, assets } = await imagesToPageSpecs(st.images, null);
+        if (!specs.length) {
+          okBtn.disabled = false;
+          okBtn.innerHTML = `${icon('sparkle')}<span>作成して開く</span>`;
+          ui.toast('画像を読み込めませんでした', { icon: 'info' });
+          return;
+        }
+        extra = { pageSpecs: specs, assets };
+      }
+      const note = await store.createNote({ title: title.value, folderId, cover: st.cover, template: useImages ? 'blank' : st.template, paper: st.paper, size: st.size, ...extra });
       s.close();
       setTimeout(() => this.app.openNote(note.id, null), 120);
     };

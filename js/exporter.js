@@ -95,7 +95,7 @@ export async function exportBackup(noteIds, onProgress) {
   const all = !noteIds;
   const notes = all ? store.state.notes.slice() : noteIds.map(store.getNote).filter(Boolean);
   const folders = all ? store.state.folders.slice() : [];
-  const out = { magic: MAGIC, version: 1, exportedAt: Date.now(), folders, notes, pages: [], assets: [] };
+  const out = { magic: MAGIC, version: 2, exportedAt: Date.now(), folders, notes, pages: [], assets: [], stamps: [] };
   let i = 0;
   for (const n of notes) {
     const pages = await store.loadPages(n.id);
@@ -103,6 +103,16 @@ export async function exportBackup(noteIds, onProgress) {
     const assets = await store.loadAssets(n.id);
     for (const a of assets) out.assets.push({ ...a, blob: undefined, data: await blobToDataURL(a.blob) });
     onProgress && onProgress(++i, notes.length);
+  }
+  if (all) {
+    for (const s of await store.loadStamps()) {
+      out.stamps.push({
+        ...s,
+        items: s.items.map(serializeItem),
+        thumb: s.thumb ? await blobToDataURL(s.thumb) : null,
+        assets: await Promise.all((s.assets || []).map(async (a) => ({ ...a, blob: undefined, data: await blobToDataURL(a.blob) }))),
+      });
+    }
   }
   return gzip(JSON.stringify(out));
 }
@@ -132,6 +142,18 @@ export async function importBackup(file) {
     const rec = { ...a, blob };
     delete rec.data;
     ops.push({ store: 'assets', put: rec });
+  }
+  for (const s of data.stamps || []) {
+    const rec = { ...s };
+    rec.items = (s.items || []).map((it) => (it.pts ? { ...it, pts: Float32Array.from(it.pts) } : it));
+    rec.thumb = s.thumb ? await dataURLToBlob(s.thumb) : null;
+    rec.assets = [];
+    for (const a of s.assets || []) {
+      const r = { ...a, blob: await dataURLToBlob(a.data) };
+      delete r.data;
+      rec.assets.push(r);
+    }
+    ops.push({ store: 'stamps', put: rec });
   }
   for (let k = 0; k < ops.length; k += 200) await db.batch(ops.slice(k, k + 200));
   await store.loadAll();
