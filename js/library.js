@@ -922,8 +922,9 @@ export class Library {
     });
   }
   newNote(folderId) {
-    const st = { ...settings.newNote, images: null };
+    const st = { ...settings.newNote, sp: { ...settings.tplSp }, images: null };
     if (st.template === 'image') st.template = 'ruled7';
+    st.template = store.tplCanon(st.template);
     const title = h('input', { class: 'input big', placeholder: '無題のノート', enterkeyhint: 'done', autocomplete: 'off' });
     const coverPrev = h('div', { class: 'nn-cover' }, h('span', { class: 'nc-spine' }), h('div', { class: 'nn-paper' }));
     const upd = () => {
@@ -982,6 +983,8 @@ export class Library {
       }
       okBtn.disabled = true;
       settings.newNote = { template: useImages ? settings.newNote.template : st.template, paper: st.paper, size: st.size, cover: st.cover };
+      const spv = store.TPL_SP[st.template] ? st.sp[st.template] || store.TPL_SP[st.template] : null;
+      if (spv) settings.tplSp = { ...settings.tplSp, [st.template]: spv };
       saveSettings();
       let extra = {};
       if (useImages) {
@@ -995,7 +998,7 @@ export class Library {
         }
         extra = { pageSpecs: specs, assets };
       }
-      const note = await store.createNote({ title: title.value, folderId, cover: st.cover, template: useImages ? 'blank' : st.template, paper: st.paper, size: st.size, ...extra });
+      const note = await store.createNote({ title: title.value, folderId, cover: st.cover, template: useImages ? 'blank' : st.template, sp: useImages ? null : spv, paper: st.paper, size: st.size, ...extra });
       s.close();
       setTimeout(() => this.app.openNote(note.id, null), 120);
     };

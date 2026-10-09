@@ -11,16 +11,28 @@ export const PAGE_SIZES = {
   long: { w: 794, h: 2246, label: '縦長' },
 };
 
+// sp = 罫線・方眼・ドットの間隔（mm）の初期値。ページごとに page.sp で自由に変えられる
 export const TEMPLATES = [
   { id: 'blank', label: '無地' },
-  { id: 'ruled7', label: '横罫 7mm' },
-  { id: 'ruled6', label: '横罫 6mm' },
-  { id: 'dotruled', label: 'ドット罫' },
-  { id: 'grid5', label: '方眼 5mm' },
-  { id: 'dot5', label: 'ドット' },
-  { id: 'cornell', label: 'コーネル' },
+  { id: 'ruled7', label: '横罫', sp: 7 },
+  { id: 'dotruled', label: 'ドット罫', sp: 6 },
+  { id: 'grid5', label: '方眼', sp: 5 },
+  { id: 'dot5', label: 'ドット', sp: 5 },
+  { id: 'cornell', label: 'コーネル', sp: 7 },
   { id: 'music', label: '五線譜' },
 ];
+export const TPL_SP = { ruled7: 7, ruled6: 6, dotruled: 6, grid5: 5, dot5: 5, cornell: 7 };
+export const SP_MIN = 2;
+export const SP_MAX = 15;
+// 旧テンプレート ID（横罫 6mm）は「横罫」＋間隔 6mm として扱う
+export const tplCanon = (t) => (t === 'ruled6' ? 'ruled7' : t);
+export function tplSpacing(page) {
+  const d = TPL_SP[page.template];
+  if (!d) return 0;
+  const s = +page.sp;
+  return s >= SP_MIN && s <= SP_MAX ? s : d;
+}
+export const fmtMM = (v) => (Math.round(v * 10) / 10).toString();
 
 export const PAPERS = [
   { c: '#ffffff', label: 'ホワイト' },
@@ -136,9 +148,10 @@ export async function deleteFolder(id) {
 }
 
 // ---------- ノート ----------
-export function newPageData(noteId, { template = 'blank', paper = '#ffffff', w = 794, h = 1123, bg = null } = {}) {
+export function newPageData(noteId, { template = 'blank', paper = '#ffffff', w = 794, h = 1123, bg = null, sp = null } = {}) {
   const p = { id: uid(), noteId, w, h, template, paper, items: [] };
   if (bg) p.bg = bg; // 画像から作ったページ（背景画像のアセット ID）
+  if (sp != null && TPL_SP[template] && +sp >= SP_MIN && +sp <= SP_MAX) p.sp = +sp; // 罫線・方眼の間隔（mm）
   return p;
 }
 
@@ -156,10 +169,10 @@ export async function createNote(opts = {}) {
     openedAt: t,
     deletedAt: null,
     pageIds: [],
-    defaults: { template: opts.template || 'ruled7', paper: opts.paper || '#ffffff', size: opts.size || 'a4p' },
+    defaults: { template: opts.template || 'ruled7', paper: opts.paper || '#ffffff', size: opts.size || 'a4p', sp: opts.sp ?? null },
   };
   // opts.pageSpecs があればそのページで作る（画像から作るノートなど）
-  const pages = (opts.pageSpecs && opts.pageSpecs.length ? opts.pageSpecs : [{ template: note.defaults.template, paper: note.defaults.paper, w: size.w, h: size.h }])
+  const pages = (opts.pageSpecs && opts.pageSpecs.length ? opts.pageSpecs : [{ template: note.defaults.template, paper: note.defaults.paper, w: size.w, h: size.h, sp: note.defaults.sp }])
     .map((s) => newPageData(note.id, s));
   const assets = (opts.assets || []).map((a) => ({ ...a, noteId: note.id }));
   note.pageIds = pages.map((p) => p.id);
@@ -265,7 +278,7 @@ export async function loadPages(noteId) {
   if (!out.length) {
     const d = (note && note.defaults) || {};
     const size = PAGE_SIZES[d.size] || PAGE_SIZES.a4p;
-    out.push(newPageData(noteId, { template: d.template || 'ruled7', paper: d.paper || '#ffffff', w: size.w, h: size.h }));
+    out.push(newPageData(noteId, { template: d.template || 'ruled7', paper: d.paper || '#ffffff', w: size.w, h: size.h, sp: d.sp }));
   }
   return out;
 }

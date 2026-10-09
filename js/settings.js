@@ -29,6 +29,7 @@ export const DEFAULTS = {
   libSort: 'updated',
   libView: 'grid',
   newNote: { template: 'ruled7', paper: '#ffffff', size: 'a4p', cover: 'indigo' },
+  tplSp: {}, // テンプレートごとに最後に選んだ間隔（mm）
   tools: {
     pen: { colors: ['#1d1d1f', '#1f5fd1', '#e5484d', '#1f8a4c'], ci: 0, widths: [1.2, 2.2, 4], wi: 1, type: 'fountain', sens: 1 },
     hl: { colors: ['#ffd60a', '#7ee0a1', '#ff9ec7', '#8cc8ff'], ci: 0, widths: [10, 16, 26], wi: 1, alpha: 0.38, straight: false },

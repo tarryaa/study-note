@@ -1,6 +1,7 @@
 // ページの描画（用紙テンプレート・ストローク・画像・テキスト）
 import { itemPath, computeBB } from './ink.js';
 import { isDarkColor } from './util.js';
+import { tplSpacing } from './store.js';
 
 export const FONT = '-apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", "Meiryo", sans-serif';
 export const LINE_H = 1.45;
@@ -47,7 +48,7 @@ export function drawTemplate(ctx, page, scale = 1, r = null) {
     case 'ruled7':
     case 'ruled6':
     case 'dotruled': {
-      const sp = (t === 'ruled7' ? 7 : 6) * MM;
+      const sp = tplSpacing(page) * MM;
       const top = 20 * MM;
       const bottom = H - 12 * MM;
       ctx.beginPath();
@@ -65,7 +66,8 @@ export function drawTemplate(ctx, page, scale = 1, r = null) {
       break;
     }
     case 'grid5': {
-      const sp = 5 * MM;
+      const mm = tplSpacing(page);
+      const sp = mm * MM;
       const ox = (W % sp) / 2, oy = (H % sp) / 2;
       ctx.strokeStyle = soft;
       ctx.beginPath();
@@ -74,20 +76,21 @@ export function drawTemplate(ctx, page, scale = 1, r = null) {
       ctx.stroke();
       ctx.strokeStyle = line;
       ctx.beginPath();
-      const sp2 = sp * 4;
+      // 太線：細かい方眼は 1cm ごと、それ以外は 4 マスごと
+      const sp2 = sp * (mm <= 3 ? Math.max(2, Math.round(10 / mm)) : 4);
       for (let x = ox; x <= W; x += sp2) vl(x);
       for (let y = oy; y <= H; y += sp2) hl(y);
       ctx.stroke();
       break;
     }
     case 'dot5': {
-      const sp = 5 * MM;
+      const sp = tplSpacing(page) * MM;
       ctx.fillStyle = dark ? 'rgba(255,255,255,0.32)' : 'rgba(64,104,168,0.45)';
       dots(sp, Math.max(0.85, 0.8 / scale), (W % sp) / 2, (H % sp) / 2);
       break;
     }
     case 'cornell': {
-      const sp = 7 * MM;
+      const sp = tplSpacing(page) * MM;
       const top = 24 * MM;
       const sum = H * 0.78;
       const cue = W * 0.3;
@@ -221,7 +224,8 @@ function fillPath(it) {
   return p;
 }
 
-export function drawItem(ctx, it, dark, assets) {
+// k = 描画の倍率（デバイスピクセル / ページ座標）。拡大時は線を滑らかに補間したパスを使う
+export function drawItem(ctx, it, dark, assets, k = 2) {
   if (it.t === 's') {
     if (it.f) {
       // 図形ツールの塗りつぶし
@@ -239,18 +243,18 @@ export function drawItem(ctx, it, dark, assets) {
       ctx.lineWidth = it.w;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-      ctx.stroke(itemPath(it));
+      ctx.stroke(itemPath(it, k));
       ctx.restore();
     } else {
       ctx.fillStyle = it.c;
-      ctx.fill(itemPath(it));
+      ctx.fill(itemPath(it, k));
     }
   } else if (it.t === 'i') drawImageItem(ctx, it, assets);
   else if (it.t === 'x') drawText(ctx, it);
 }
 
 export function drawItems(ctx, page, opts = {}) {
-  const { hidden, rect, assets } = opts;
+  const { hidden, rect, assets, scale = 2 } = opts;
   const dark = isDarkColor(page.paper);
   const items = page.items;
   for (let i = 0; i < items.length; i++) {
@@ -260,7 +264,7 @@ export function drawItems(ctx, page, opts = {}) {
       const b = it.bb;
       if (b[0] > rect.x + rect.w || b[2] < rect.x || b[1] > rect.y + rect.h || b[3] < rect.y) continue;
     }
-    drawItem(ctx, it, dark, assets);
+    drawItem(ctx, it, dark, assets, scale);
   }
 }
 
@@ -280,7 +284,7 @@ export function renderPageTo(ctx, page, sx, sy, opts = {}) {
   ctx.fillRect(0, 0, page.w, page.h);
   drawBg(ctx, page, opts.assets);
   drawTemplate(ctx, page, sx);
-  drawItems(ctx, page, opts);
+  drawItems(ctx, page, { ...opts, scale: Math.max(sx, sy) });
 }
 
 // ページの一部だけ描き直す（ctx はページ座標に変換済み）
@@ -293,7 +297,7 @@ export function renderRegion(ctx, page, r, scale, opts = {}) {
   ctx.fillRect(r.x, r.y, r.w, r.h);
   drawBg(ctx, page, opts.assets);
   drawTemplate(ctx, page, scale, r);
-  drawItems(ctx, page, { ...opts, rect: r });
+  drawItems(ctx, page, { ...opts, rect: r, scale });
   ctx.restore();
 }
 

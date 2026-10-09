@@ -140,18 +140,102 @@ export function buildLinePath(pts) {
   return new Path2D(out.join(''));
 }
 
-const pathCache = new WeakMap();
-export function itemPath(it) {
-  let p = pathCache.get(it);
-  if (!p) {
-    p = it.k === 'hl' ? buildLinePath(it.pts) : buildInkPath(it.pts);
-    pathCache.set(it, p);
+// ---------- 拡大しても角が出ない滑らかな線 ----------
+// 保存している点列は折れ線なので、強く拡大すると角（カクカク）が見えてしまう。
+// 表示倍率に応じて、点と点のあいだを centripetal Catmull-Rom で補間して細かくする。
+//  - 曲がり方が急な点（50° 以上）は「角」として補間しない（図形やカクッとした字はシャープなまま）
+//  - 1 デバイスピクセルの 1/10 未満の誤差しか出ない区間は分割しない（普段の倍率では元の点列そのまま）
+const CORNER_COS = Math.cos((50 * Math.PI) / 180);
+export const LOD_K0 = 4; // この倍率（デバイスピクセル/ページ座標）までは補間なし相当
+export const lodOf = (k) => (k <= LOD_K0 ? 0 : Math.min(5, Math.ceil(Math.log2(k / LOD_K0) - 1e-9)));
+const lodK = (l) => LOD_K0 * Math.pow(2, l);
+
+function crPoint(out, x0, y0, x1, y1, x2, y2, x3, y3, u) {
+  // Barry–Goldman（centripetal：ノット間隔 = 距離^0.5）
+  const t1 = Math.sqrt(Math.hypot(x1 - x0, y1 - y0)) || 1e-6;
+  const t2 = t1 + (Math.sqrt(Math.hypot(x2 - x1, y2 - y1)) || 1e-6);
+  const t3 = t2 + (Math.sqrt(Math.hypot(x3 - x2, y3 - y2)) || 1e-6);
+  const t = t1 + (t2 - t1) * u;
+  const a1x = ((t1 - t) * x0 + t * x1) / t1, a1y = ((t1 - t) * y0 + t * y1) / t1;
+  const a2x = ((t2 - t) * x1 + (t - t1) * x2) / (t2 - t1), a2y = ((t2 - t) * y1 + (t - t1) * y2) / (t2 - t1);
+  const a3x = ((t3 - t) * x2 + (t - t2) * x3) / (t3 - t2), a3y = ((t3 - t) * y2 + (t - t2) * y3) / (t3 - t2);
+  const b1x = ((t2 - t) * a1x + t * a2x) / t2, b1y = ((t2 - t) * a1y + t * a2y) / t2;
+  const b2x = ((t3 - t) * a2x + (t - t1) * a3x) / (t3 - t1), b2y = ((t3 - t) * a2y + (t - t1) * a3y) / (t3 - t1);
+  out[0] = ((t2 - t) * b1x + (t - t1) * b2x) / (t2 - t1);
+  out[1] = ((t2 - t) * b1y + (t - t1) * b2y) / (t2 - t1);
+}
+
+// pts を倍率 k で滑らかに見える点列にする（sharp = 図形：補間しない）
+export function refinePts(pts, k, sharp) {
+  const n = pts.length / 3;
+  if (sharp || n < 3) return pts;
+  const tol = 0.1 / k;
+  const closed = n > 3 && Math.hypot(pts[0] - pts[(n - 1) * 3], pts[1] - pts[(n - 1) * 3 + 1]) < 1e-3;
+  const X = (i) => pts[i * 3], Y = (i) => pts[i * 3 + 1];
+  // i の前後で急に曲がっているか
+  const corner = (i) => {
+    let a = i - 1, b = i + 1;
+    if (closed) {
+      if (a < 0) a = n - 2;
+      if (b > n - 1) b = 1;
+    } else if (a < 0 || b > n - 1) return true;
+    const ux = X(i) - X(a), uy = Y(i) - Y(a), vx = X(b) - X(i), vy = Y(b) - Y(i);
+    const lu = Math.hypot(ux, uy), lv = Math.hypot(vx, vy);
+    if (lu < 1e-6 || lv < 1e-6) return true;
+    return (ux * vx + uy * vy) / (lu * lv) < CORNER_COS;
+  };
+  const isC = new Uint8Array(n);
+  for (let i = 0; i < n; i++) isC[i] = corner(i) ? 1 : 0;
+  const out = [pts[0], pts[1], pts[2]];
+  const q = [0, 0];
+  let added = 0;
+  for (let i = 0; i < n - 1; i++) {
+    const x1 = X(i), y1 = Y(i), x2 = X(i + 1), y2 = Y(i + 1);
+    const r1 = pts[i * 3 + 2], r2 = pts[i * 3 + 5];
+    let x0, y0, x3, y3;
+    if (isC[i]) { x0 = 2 * x1 - x2; y0 = 2 * y1 - y2; }
+    else { const a = i - 1 < 0 ? n - 2 : i - 1; x0 = X(a); y0 = Y(a); }
+    if (isC[i + 1]) { x3 = 2 * x2 - x1; y3 = 2 * y2 - y1; }
+    else { const b = i + 2 > n - 1 ? 1 : i + 2; x3 = X(b); y3 = Y(b); }
+    let m = 1;
+    if (!(isC[i] && isC[i + 1])) {
+      crPoint(q, x0, y0, x1, y1, x2, y2, x3, y3, 0.5);
+      const dev = Math.hypot(q[0] - (x1 + x2) / 2, q[1] - (y1 + y2) / 2);
+      if (dev > tol) m = Math.min(32, Math.ceil(Math.sqrt(dev / tol)));
+    }
+    for (let s = 1; s < m; s++) {
+      const u = s / m;
+      crPoint(q, x0, y0, x1, y1, x2, y2, x3, y3, u);
+      out.push(q[0], q[1], r1 + (r2 - r1) * u);
+      added++;
+    }
+    out.push(x2, y2, r2);
   }
+  return added ? Float32Array.from(out) : pts;
+}
+
+// 倍率 k で描くためのパス（拡大の段階ごとにキャッシュ）
+export function strokePath(pts, isHl, k, sharp) {
+  const p = refinePts(pts, lodK(lodOf(k)), sharp);
+  return isHl ? buildLinePath(p) : buildInkPath(p);
+}
+
+const pathCache = new WeakMap();
+export function itemPath(it, k = 2) {
+  const l = lodOf(k);
+  let arr = pathCache.get(it);
+  if (!arr) pathCache.set(it, (arr = []));
+  let p = arr[l];
+  if (!p) p = arr[l] = strokePath(it.pts, it.k === 'hl', k, it.sh);
   return p;
 }
-// 書き終わった直後は、ライブ描画で作ったパスをそのまま使う（ペンを離した瞬間のカクつき防止）
-export function setItemPath(it, path) {
-  if (path) pathCache.set(it, path);
+// 書き終わった直後は、ライブ描画で作ったパスをそのまま使う
+// （書いている時と 1px も違わない形で確定させる。ペンを離した瞬間に線が変わって見えない）
+export function setItemPath(it, path, k = 2) {
+  if (!path) return;
+  let arr = pathCache.get(it);
+  if (!arr) pathCache.set(it, (arr = []));
+  arr[lodOf(k)] = path;
 }
 
 export function computeBB(pts) {
@@ -348,7 +432,7 @@ export class LiveStroke {
     if (this.ink) this.ink.cap();
   }
   points() {
-    const tol = this.kind === 'hl' ? 0.3 / this.z : Math.min(0.16, 0.1 / this.z);
+    const tol = this.kind === 'hl' ? 0.2 / this.z : Math.min(0.1, 0.06 / this.z);
     return simplify(this.dense, tol);
   }
   // 図形認識用：平滑化済みの点＋最後の生点

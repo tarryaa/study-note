@@ -316,14 +316,7 @@ export class Editor {
       const pv = this.engine.pvs[i];
       if (pv) {
         snap = { rect: this.engine.pageScreenRect(i), canvas: null, paper: pv.page.paper };
-        const c = document.createElement('canvas');
-        const w = Math.min(600, Math.round(pv.page.w));
-        c.width = w;
-        c.height = Math.round((w * pv.page.h) / pv.page.w);
-        const ctx = c.getContext('2d');
-        if (pv.scale > 0 && pv.cv.width) ctx.drawImage(pv.cv, 0, 0, c.width, c.height);
-        else ctx.drawImage(renderThumb(pv.page, w, this.engine.assets), 0, 0);
-        snap.canvas = c;
+        snap.canvas = this.engine.pageImage(i, Math.min(600, Math.round(pv.page.w)));
       }
       const first = this.engine.pages()[0];
       const tcv = renderThumb(first, 360, this.engine.assets);
@@ -1157,7 +1150,10 @@ export class Editor {
   pageSetup(mode, index) {
     const pages = this.engine.pages();
     const ref = pages[clamp(mode === 'edit' ? index : index - 1, 0, pages.length - 1)];
-    const st = { template: ref.bg ? 'blank' : ref.template, paper: ref.paper, size: sizeKeyOf(ref.w, ref.h) || 'a4p', scope: 'this', images: null };
+    const tpl = ref.bg ? 'blank' : store.tplCanon(ref.template);
+    const sp = { ...settings.tplSp };
+    if (store.TPL_SP[ref.template]) sp[tpl] = store.tplSpacing(ref);
+    const st = { template: tpl, sp, paper: ref.paper, size: sizeKeyOf(ref.w, ref.h) || 'a4p', scope: 'this', images: null };
     const fileIn = h('input', { type: 'file', accept: 'image/*', hidden: true });
     if (mode === 'add') fileIn.multiple = true;
     const sizeBox = h('div', {}, h('h4', { text: 'サイズ' }), sizeChips(st));
@@ -1213,7 +1209,12 @@ export class Editor {
         return;
       }
       const size = store.PAGE_SIZES[st.size] || { w: ref.w, h: ref.h };
-      const props = { template: st.template, paper: st.paper, w: size.w, h: size.h, bg: null };
+      const spv = store.TPL_SP[st.template] ? st.sp[st.template] || store.TPL_SP[st.template] : null;
+      if (spv) {
+        settings.tplSp = { ...settings.tplSp, [st.template]: spv };
+        saveSettings();
+      }
+      const props = { template: st.template, sp: spv, paper: st.paper, w: size.w, h: size.h, bg: null };
       if (mode === 'edit') {
         this.engine.setPageProps(st.scope === 'all' ? this.engine.pages() : [this.engine.pages()[index]], props);
         ui.hud('ページを更新', 'template');

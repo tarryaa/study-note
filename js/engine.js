@@ -7,14 +7,13 @@
 //  - ページは CSS transform でパン・ズーム（再描画なし）
 //
 // 画質のための設計:
-//  - ページごとの「土台キャンバス」（ズームアウト時はズームに合わせて軽量化）
-//  - 拡大時は画面に見えている部分だけを 512px のタイルに分けて、表示倍率ちょうどの解像度で描く
-//    （パンで新しく見えた部分も、その場ですぐ高精細タイルを描き足す）
+//  - 画面に見えている部分を、いつでも表示倍率ちょうどの解像度で描く（詳しくは「描画」の章）
+//  - ズームアウトしても解像度を落として見せることはしない。拡大しても線は滑らかに補間して描き直す
 import { h, clamp, uid, isDarkColor, reducedMotion } from './util.js';
 import { icon } from './icons.js';
 import { settings, saveSettings } from './settings.js';
 import {
-  LiveStroke, buildInkPath, buildLinePath, computeBB, hitStrokeCircle, hitStrokeSegment,
+  LiveStroke, strokePath, computeBB, hitStrokeCircle, hitStrokeSegment,
   splitStroke, itemPath, setItemPath, PEN_TYPES, pointInPoly, convexHull, insideFraction, cutStrokeByPoly,
 } from './ink.js';
 import { detectScribble } from './scribble.js';
@@ -24,15 +23,15 @@ import { newPageData, cloneItem } from './store.js';
 
 const GAP = 72; // ページ同士の間隔（横並び）
 export const MAX_Z = 10;
-const BASE_PX = 4.5e6; // 土台キャンバス 1 枚の最大ピクセル数
-const MEM_PX = 22e6; // 土台キャンバス全体の上限
-const TILE = 512; // 高精細タイルの大きさ（デバイスピクセル）
-const MAX_TILES = 110;
+const LIVE_COST = 12000; // ズーム中にフレームごとに描き直してよい重さの目安（見えている点の数）
+const PREVIEW_PX = 1.1e6; // 予備の縮小版 1 枚のピクセル数
 const SEL_PX = 10e6;
 const EDGE = 18; // 拡大時にページの端を寄せる位置（px）
 const HOLD_MS = 420; // 図形補正までの長押し時間
 const PULL = 120; // 最後のページで横に引っ張ってページを追加するまでの距離
 const now = () => performance.now();
+// 図形補正のうち角のあるもの（線を滑らかに補間しない）
+const SHARP_KINDS = new Set(['line', 'polyline', 'rect', 'triangle', 'polygon']);
 
 export const clipboard = { items: null, bb: null, assets: new Map() };
 
@@ -105,13 +104,15 @@ export class Engine {
     });
     this.ghost.addEventListener('click', () => this.hooks.onAddPageEnd && this.hooks.onAddPageEnd());
     this.world.append(this.ghost);
+    this.tileRoot = h('div', { class: 'tile-root' });
+    this.overWorld = h('div', { class: 'world over' }); // 選択中のもの（タイルより上）
     this.frozenCv = h('canvas', { class: 'ink-layer' });
     this.inkCv = h('canvas', { class: 'ink-layer' });
     this.inkWrap = h('div', { class: 'ink-wrap' }, this.frozenCv, this.inkCv);
     this.fxCv = h('canvas', { class: 'fx-layer' });
     this.selUi = h('div', { class: 'sel-ui' });
     this.cursor = h('div', { class: 'pen-cursor' });
-    stage.append(this.world, this.inkWrap, this.fxCv, this.selUi, this.cursor);
+    stage.append(this.world, this.tileRoot, this.overWorld, this.inkWrap, this.fxCv, this.selUi, this.cursor);
     this.frozenCtx = this.frozenCv.getContext('2d');
     this.inkCtx = this.inkCv.getContext('2d');
     this.fxCtx = this.fxCv.getContext('2d');
@@ -123,7 +124,13 @@ export class Engine {
     this.rect = { left: 0, top: 0 };
     this.pvs = [];
     this.pvMap = new Map();
-    this.tiles = new Map();
+    this.layer = null;
+    this.pool = [];
+    this.T = 0;
+    this.tcss = 0;
+    this.maxTiles = 60;
+    this.wheelZoomT = 0;
+    this.animZoom = false;
     this.tool = 'pen';
     this.accent = '#5b6cf0';
     this.undoStack = [];
@@ -141,8 +148,6 @@ export class Engine {
     this.fxAnim = 0;
     this._rq = 0;
     this._settleT = 0;
-    this._lvl = 0;
-    this._lvlT = 0;
     this.lastViewChange = 0;
     this.inkDirty = null;
     this.frozenDirty = null;
@@ -208,6 +213,7 @@ export class Engine {
     this.inkDirty = null;
     this.frozenDirty = null;
     this.fxDirty = null;
+    this.setTileGeom();
     if (!this.loaded) return;
     if (!this.viewInit) return this.initView();
     if (state) this.applyViewState(state, true);
@@ -312,7 +318,7 @@ export class Engine {
     const cv = h('canvas', { class: 'page-cv' });
     const num = h('div', { class: 'page-num' });
     el.append(cv, num);
-    const pv = { page, el, cv, ctx: null, scale: 0, sx: 1, sy: 1, dirty: true, hidden: null, x: 0, y: 0, num };
+    const pv = { page, el, cv, pctx: null, ps: 0, pdirty: true, prow: 0, hidden: null, x: 0, y: 0, num };
     this.pvMap.set(page, pv);
     this.world.insertBefore(el, this.ghost);
     return pv;
@@ -321,7 +327,9 @@ export class Engine {
     if (this.action) this.cancelAction();
     this.commitText();
     this.clearSelection();
-    for (const [k, t] of this.tiles) this.removeTile(k, t);
+    this.dropLayer(this.layer);
+    this.layer = null;
+    clearTimeout(this._prevT);
     for (const pv of this.pvs) {
       pv.cv.width = 0;
       pv.cv.height = 0;
@@ -409,29 +417,33 @@ export class Engine {
       g.width = last.page.w + 'px';
       g.height = last.page.h + 'px';
     }
+    this.invalidateAll();
   }
 
   // ---------------------------------------------------------------- 表示（パン・ズーム）
   setView(tx, ty, z) {
+    // 平行移動はデバイスピクセル単位に揃える（タイルを 1:1 で表示してにじませないため）
+    const d = this.dpr;
+    tx = Math.round(tx * d) / d;
+    ty = Math.round(ty * d) / d;
     const v = this.view;
     v.tx = tx;
     v.ty = ty;
     v.z = z;
-    this.world.style.transform = `translate3d(${tx}px, ${ty}px, 0) scale(${z})`;
+    const tf = `translate3d(${tx}px, ${ty}px, 0) scale(${z})`;
+    this.world.style.transform = tf;
+    this.overWorld.style.transform = tf;
+    this.positionLayer();
     this.lastViewChange = now();
     this.onViewChanged();
   }
   onViewChanged() {
-    this.updateVisibility();
     this.requestRender();
     if (this.sel) this.updateSelUi();
     if (this.textEdit) this.positionText();
     if (this.hooks.onView) this.hooks.onView(this.view);
     clearTimeout(this._settleT);
     this._settleT = setTimeout(() => this.settle(), 140);
-  }
-  isSettled() {
-    return !this.tg && !this.anim && now() - this.lastViewChange > 100;
   }
   settle() {
     if (!this.loaded) return;
@@ -441,7 +453,7 @@ export class Engine {
       return;
     }
     this.requestRender();
-    if (this.sel && Math.abs(this.sel.k - this.view.z * this.dpr) / this.sel.k > 0.3) this.renderSelCanvas();
+    if (this.sel && this.selStale()) this.renderSelCanvas();
     if (this.hooks.onSettle) this.hooks.onSettle();
   }
   stopAnim() {
@@ -454,6 +466,7 @@ export class Engine {
     this.stopAnim();
     const from = { ...this.view };
     const t0 = now();
+    this.animZoom = Math.abs(to.z - from.z) > 1e-6;
     if (reducedMotion()) dur = 1;
     const step = () => {
       const t = Math.min(1, (now() - t0) / dur);
@@ -497,6 +510,7 @@ export class Engine {
   }
   startInertia(vx, vy, from) {
     this.stopAnim();
+    this.animZoom = false;
     let last = now();
     const step = () => {
       const tn = now();
@@ -604,6 +618,14 @@ export class Engine {
   }
 
   // ---------------------------------------------------------------- 描画
+  // 画質のための設計:
+  //  - 画面に見えている部分を「表示倍率ちょうど（k = z × dpr）」の解像度で、デバイスピクセルの格子に
+  //    ぴったり揃えたタイルに描く。小さく描いた画像を引き伸ばして見せることはしないので、
+  //    最大までズームしてもぼやけ・モザイクが出ない
+  //  - パンはタイルを整数ピクセル単位で動かすだけ（拡大縮小のにじみなし）。新しく見えた所はその場で描く
+  //  - ズーム中も、描き直しが間に合うならフレームごとに描き直す。間に合わない重いページだけ、
+  //    ズーム操作中は一時的に拡大表示して、指を離した瞬間に一度で描き直す（段階的な画質切り替えはしない）
+  //  - 書き終えた線は「書いている時と同じ変換・同じパス」でタイルに描くので、ペンを離しても 1px も変わらない
   visibleRect() {
     const { tx, ty, z } = this.view;
     return { x: -tx / z, y: -ty / z, w: this.sw / z, h: this.sh / z };
@@ -616,247 +638,303 @@ export class Engine {
     const m = Math.max(vr.w, vr.h) * f;
     return { x: vr.x - m, y: vr.y - m, w: vr.w + 2 * m, h: vr.h + 2 * m };
   }
-  updateVisibility() {
-    if (!this.loaded) return;
-    const near = this.nearRect(0.6), far = this.nearRect(1.6);
-    let total = 0;
-    const alive = [];
-    for (const pv of this.pvs) {
-      const r = this.pvRect(pv);
-      if (!overlap(r, near) && pv.scale > 0 && !overlap(r, far)) this.releasePV(pv);
-      if (pv.scale > 0) {
-        total += pv.cv.width * pv.cv.height;
-        alive.push(pv);
-      }
+  setTileGeom() {
+    // タイル 1 枚 = 約 512 デバイスピクセル（CSS ピクセルで整数になる大きさにして、継ぎ目を出さない）
+    const css = Math.max(64, Math.round(512 / this.dpr));
+    const T = Math.round(css * this.dpr);
+    if (T !== this.T) {
+      this.dropLayer(this.layer);
+      this.layer = null;
+      for (const cv of this.pool) cv.width = cv.height = 0;
+      this.pool = [];
     }
-    // 土台キャンバスの総メモリを制限
-    if (total > MEM_PX) {
-      const vr = this.visibleRect();
-      const cx = vr.x + vr.w / 2;
-      alive.sort((a, b) => Math.abs(b.x + b.page.w / 2 - cx) - Math.abs(a.x + a.page.w / 2 - cx));
-      for (const pv of alive) {
-        if (total <= MEM_PX) break;
-        if (overlap(this.pvRect(pv), near)) continue;
-        total -= pv.cv.width * pv.cv.height;
-        this.releasePV(pv);
-      }
-    }
-  }
-  releasePV(pv) {
-    pv.cv.width = 0;
-    pv.cv.height = 0;
-    pv.scale = 0;
-    pv.dirty = true;
-    this.dropTiles(pv);
+    this.tcss = css;
+    this.T = T;
+    const cols = Math.ceil((this.sw * this.dpr) / T) + 1, rows = Math.ceil((this.sh * this.dpr) / T) + 1;
+    this.maxTiles = Math.max(24, Math.ceil(cols * rows * 3.2));
   }
   requestRender() {
     if (!this._rq) this._rq = requestAnimationFrame(() => this.renderTick());
   }
-  baseCap(pv) {
-    return Math.sqrt(BASE_PX / (pv.page.w * pv.page.h));
+  renderAllNow() {
+    if (this._rq) cancelAnimationFrame(this._rq);
+    this._rq = 0;
+    this.renderTick();
   }
-  targetScale(pv) {
-    const want = Math.ceil(this.view.z * this.dpr * 4) / 4;
-    return Math.max(0.2, Math.min(this.baseCap(pv), want));
+  isZooming() {
+    return !!((this.tg && this.tg.mode === 'pinch') || (this.anim && this.animZoom) || now() - this.wheelZoomT < 220);
   }
-  needsRender(pv) {
-    if (pv.scale === 0 || pv.dirty) return true;
-    if (!this.isSettled()) return false;
-    const t = this.targetScale(pv);
-    return pv.scale < t * 0.92 || pv.scale > t * 1.8;
-  }
-  needsTiles(pv) {
-    return this.view.z * this.dpr > this.baseCap(pv) * 1.03;
+  // 見えている部分の描画の重さ（点の数など）→ ズーム中に毎フレーム描き直せるかの見積もりに使う
+  visibleCost() {
+    const vr = this.visibleRect();
+    let c = 0;
+    for (const pv of this.pvs) {
+      if (!overlap(this.pvRect(pv), vr)) continue;
+      c += 150;
+      const x0 = vr.x - pv.x, y0 = vr.y - pv.y, x1 = x0 + vr.w, y1 = y0 + vr.h;
+      for (const it of pv.page.items) {
+        const b = it.bb;
+        if (b[0] > x1 || b[2] < x0 || b[1] > y1 || b[3] < y0) continue;
+        c += it.t === 's' ? it.pts.length / 3 + 4 : 60;
+      }
+    }
+    return c;
   }
   renderTick() {
     this._rq = 0;
-    if (!this.loaded) return;
-    const t0 = now();
-    const budget = this.tg ? 7 : 12;
-    const near = this.nearRect(0.6);
-    const vr = this.visibleRect();
-    const cx = vr.x + vr.w / 2;
-    const list = this.pvs.filter((pv) => overlap(this.pvRect(pv), near) && this.needsRender(pv));
-    list.sort((a, b) => Math.abs(a.x + a.page.w / 2 - cx) - Math.abs(b.x + b.page.w / 2 - cx));
-    for (let i = 0; i < list.length; i++) {
-      if (i > 0 && now() - t0 > budget) {
-        this.requestRender();
+    if (!this.loaded || !this.sw || !this.T) return;
+    const k = this.view.z * this.dpr;
+    let L = this.layer;
+    if (!L || L.k !== k) {
+      const zooming = L && this.isZooming();
+      // 重さ = 見えている点の数 ＋ タイル 1 枚あたりの手間
+      // （描画は GPU 側で後から実行されるので JS の計測時間はあてにならない。固定の目安で判断する）
+      if (!zooming || this.visibleCost() + this.visibleTileCount() * 250 <= LIVE_COST) {
+        this.rebuildLayer(k);
+      } else {
+        // 重いページのズーム中：今のタイルを拡大縮小して見せ、操作が終わったら描き直す
+        clearTimeout(this._zoomT);
+        this._zoomT = setTimeout(() => this.requestRender(), 120);
         return;
       }
-      this.renderPV(list[i]);
+      L = this.layer;
     }
-    this.updateTiles(t0, budget);
-  }
-  renderPV(pv) {
-    const t = this.targetScale(pv);
-    const W = Math.max(1, Math.round(pv.page.w * t)), H = Math.max(1, Math.round(pv.page.h * t));
-    if (pv.cv.width !== W || pv.cv.height !== H) {
-      pv.cv.width = W;
-      pv.cv.height = H;
+    this.fillVisible(L);
+    if (!this.action && !this.isZooming()) {
+      const busy = this.tg || this.anim;
+      if (this.prefetch(L, now() + (busy ? 3 : 6))) this.requestRender();
+      else if (!busy) this.schedulePreviews();
     }
-    if (!pv.ctx) pv.ctx = pv.cv.getContext('2d');
-    pv.sx = W / pv.page.w;
-    pv.sy = H / pv.page.h;
-    renderPageTo(pv.ctx, pv.page, pv.sx, pv.sy, { hidden: pv.hidden, assets: this.assets });
-    pv.scale = t;
-    pv.dirty = false;
+    this.evictTiles(L);
+    if (this.pool.length > 8) for (const cv of this.pool.splice(8)) cv.width = cv.height = 0;
   }
-  renderAllNow() {
-    const vr = this.visibleRect();
-    for (const pv of this.pvs) if (overlap(this.pvRect(pv), vr) && this.needsRender(pv)) this.renderPV(pv);
-    this.requestRender();
+  positionLayer() {
+    const L = this.layer;
+    if (!L) return;
+    const { tx, ty, z } = this.view;
+    const s = (z * this.dpr) / L.k;
+    L.el.style.transform = `translate3d(${tx}px, ${ty}px, 0)` + (Math.abs(s - 1) > 1e-9 ? ` scale(${s})` : '');
   }
-
-  // ---- 高精細タイル
-  tileLevel() {
-    return Math.ceil(Math.log2(this.view.z * this.dpr) * 3 - 0.02);
+  // 画面（＋余白 pad デバイスピクセル）に掛かるタイル番号の範囲。タイルはワールド座標 × k の空間に並ぶ
+  tileSpan(padX = 0, padY = 0) {
+    const T = this.T, d = this.dpr;
+    const ox = Math.round(this.view.tx * d), oy = Math.round(this.view.ty * d);
+    const W = Math.round(this.sw * d), H = Math.round(this.sh * d);
+    return {
+      i0: Math.floor((-ox - padX) / T),
+      i1: Math.floor((W - ox + padX - 1) / T),
+      j0: Math.floor((-oy - padY) / T),
+      j1: Math.floor((H - oy + padY - 1) / T),
+    };
   }
-  updateTiles(t0, budget) {
-    const lvl = this.tileLevel();
-    const s = Math.pow(2, lvl / 3);
-    const Tw = TILE / s;
-    if (lvl !== this._lvl) {
-      this._lvl = lvl;
-      this._lvlT = now();
+  visibleTileCount() {
+    const s = this.tileSpan();
+    return (s.i1 - s.i0 + 1) * (s.j1 - s.j0 + 1);
+  }
+  tileHasPage(k, i, j) {
+    const T = this.T;
+    const x0 = (i * T) / k, y0 = (j * T) / k, w = T / k;
+    for (const pv of this.pvs) if (pv.x < x0 + w && pv.x + pv.page.w > x0 && pv.y < y0 + w && pv.y + pv.page.h > y0) return true;
+    return false;
+  }
+  makeLayer(k) {
+    const el = h('div', { class: 'tile-layer' });
+    this.tileRoot.append(el);
+    return { k, el, tiles: new Map() };
+  }
+  dropLayer(L) {
+    if (!L) return;
+    for (const t of L.tiles.values()) this.freeTile(t);
+    L.tiles.clear();
+    L.el.remove();
+  }
+  freeTile(t) {
+    t.cv.remove();
+    this.pool.push(t.cv);
+  }
+  getTile(L, i, j) {
+    const key = i + ',' + j;
+    let t = L.tiles.get(key);
+    if (t) return t;
+    const cv = this.pool.pop() || h('canvas', { class: 'tile' });
+    if (cv.width !== this.T || cv.height !== this.T) {
+      cv.width = this.T;
+      cv.height = this.T;
     }
-    const pinching = this.tg && this.tg.mode === 'pinch';
-    const allow = !pinching || now() - this._lvlT > 140;
-    const vr = this.visibleRect();
-    const pad = Math.max(vr.w, vr.h) * 0.15;
-    const pre = { x: vr.x - pad, y: vr.y - pad, w: vr.w + 2 * pad, h: vr.h + 2 * pad };
-    const cx = vr.x + vr.w / 2, cy = vr.y + vr.h / 2;
-    const need = [];
-    const keep = new Set();
-    const tn = now();
+    const st = cv.style;
+    st.left = i * this.tcss + 'px';
+    st.top = j * this.tcss + 'px';
+    st.width = this.tcss + 'px';
+    st.height = this.tcss + 'px';
+    L.el.append(cv);
+    t = { key, i, j, cv, ctx: cv.getContext('2d'), dirty: true };
+    L.tiles.set(key, t);
+    return t;
+  }
+  renderTile(L, t) {
+    const ctx = t.ctx, k = L.k, T = this.T;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, T, T);
+    const x0 = (t.i * T) / k, y0 = (t.j * T) / k, w = T / k;
     for (const pv of this.pvs) {
-      if (!this.needsTiles(pv) || !overlap(this.pvRect(pv), pre)) continue;
-      const nx = Math.ceil(pv.page.w / Tw), ny = Math.ceil(pv.page.h / Tw);
-      const i0 = Math.max(0, Math.floor((pre.x - pv.x) / Tw)), i1 = Math.min(nx - 1, Math.floor((pre.x + pre.w - pv.x) / Tw));
-      const j0 = Math.max(0, Math.floor((pre.y - pv.y) / Tw)), j1 = Math.min(ny - 1, Math.floor((pre.y + pre.h - pv.y) / Tw));
-      for (let j = j0; j <= j1; j++) {
-        for (let i = i0; i <= i1; i++) {
-          const key = pv.page.id + '|' + lvl + '|' + i + '|' + j;
-          keep.add(key);
-          const t = this.tiles.get(key);
-          if (t && !t.dirty) {
-            t.used = tn;
-            continue;
-          }
-          const x = pv.x + i * Tw, y = pv.y + j * Tw;
-          const vis = overlap({ x, y, w: Tw, h: Tw }, vr);
-          need.push({ pv, i, j, key, d: Math.hypot(x + Tw / 2 - cx, y + Tw / 2 - cy) + (vis ? 0 : 1e7), vis });
+      const px0 = Math.max(0, x0 - pv.x), py0 = Math.max(0, y0 - pv.y);
+      const px1 = Math.min(pv.page.w, x0 + w - pv.x), py1 = Math.min(pv.page.h, y0 + w - pv.y);
+      if (px1 <= px0 || py1 <= py0) continue;
+      ctx.setTransform(k, 0, 0, k, pv.x * k - t.i * T, pv.y * k - t.j * T);
+      renderRegion(ctx, pv.page, { x: px0, y: py0, w: px1 - px0, h: py1 - py0 }, k, { hidden: pv.hidden, assets: this.assets });
+    }
+    t.dirty = false;
+  }
+  rebuildLayer(k) {
+    // 同じ処理の中で古いタイルを片付けて新しいタイルを描くので、途中の状態が画面に出ることはない
+    this.dropLayer(this.layer);
+    this.layer = this.makeLayer(k);
+    this.positionLayer();
+    this.fillVisible(this.layer);
+  }
+  // 見えているタイルは必ずその場で描く（描きかけ・低画質の状態を見せない）
+  fillVisible(L) {
+    const s = this.tileSpan();
+    for (let j = s.j0; j <= s.j1; j++) {
+      for (let i = s.i0; i <= s.i1; i++) {
+        const t = L.tiles.get(i + ',' + j);
+        if (t ? !t.dirty : !this.tileHasPage(L.k, i, j)) continue;
+        this.renderTile(L, t || this.getTile(L, i, j));
+      }
+    }
+  }
+  // 空き時間に、画面のまわり → 左右のページ（スワイプ先）の順で先に描いておく
+  prefetch(L, deadline) {
+    const T = this.T;
+    const vis = this.tileSpan();
+    const ci = (vis.i0 + vis.i1) / 2, cj = (vis.j0 + vis.j1) / 2;
+    for (const s of [this.tileSpan(T, T), this.tileSpan(Math.round(this.sw * this.dpr), T)]) {
+      const list = [];
+      for (let j = s.j0; j <= s.j1; j++) {
+        for (let i = s.i0; i <= s.i1; i++) {
+          const t = L.tiles.get(i + ',' + j);
+          if (t ? !t.dirty : !this.tileHasPage(L.k, i, j)) continue;
+          list.push({ i, j, t, d: (i - ci) * (i - ci) + (j - cj) * (j - cj) });
         }
       }
-    }
-    need.sort((a, b) => a.d - b.d);
-    let done = 0;
-    if (allow) {
-      for (const n of need) {
-        if (done > 0 && now() - t0 > budget) break;
-        this.renderTile(n.pv, n.i, n.j, lvl, s, Tw, n.key);
-        done++;
+      list.sort((a, b) => a.d - b.d);
+      for (const c of list) {
+        if (now() > deadline) return true;
+        if (!c.t && L.tiles.size >= this.maxTiles) return false;
+        this.renderTile(L, c.t || this.getTile(L, c.i, c.j));
       }
     }
-    const pending = need.slice(done);
-    if (pending.length) this.requestRender();
-    // 見えている部分が新しい解像度で揃ったら、古い解像度のタイルを片付ける
-    if (!pending.some((n) => n.vis)) {
-      for (const [key, t] of this.tiles) {
-        if (keep.has(key)) continue;
-        if (t.lvl !== lvl || !this.needsTiles(t.pv)) this.removeTile(key, t);
-      }
-    }
-    if (this.tiles.size > MAX_TILES) {
-      const old = [...this.tiles].filter(([k]) => !keep.has(k)).sort((a, b) => a[1].used - b[1].used);
-      while (this.tiles.size > MAX_TILES && old.length) {
-        const [k, t] = old.shift();
-        this.removeTile(k, t);
-      }
+    return false;
+  }
+  evictTiles(L) {
+    if (L.tiles.size <= this.maxTiles) return;
+    const vis = this.tileSpan();
+    const ci = (vis.i0 + vis.i1) / 2, cj = (vis.j0 + vis.j1) / 2;
+    const d = (t) => (t.i - ci) * (t.i - ci) + (t.j - cj) * (t.j - cj);
+    const arr = [...L.tiles.values()].sort((a, b) => d(b) - d(a));
+    for (const t of arr) {
+      if (L.tiles.size <= this.maxTiles * 0.85) break;
+      if (t.i >= vis.i0 && t.i <= vis.i1 && t.j >= vis.j0 && t.j <= vis.j1) continue;
+      L.tiles.delete(t.key);
+      this.freeTile(t);
     }
   }
-  renderTile(pv, i, j, lvl, s, Tw, key) {
-    let t = this.tiles.get(key);
-    if (!t) {
-      const x = i * Tw, y = j * Tw;
-      // 隣のタイルと少し重ねて継ぎ目を消す
-      const w = Math.min(Tw + (x + Tw < pv.page.w ? 1.5 / s : 0), pv.page.w - x);
-      const hh = Math.min(Tw + (y + Tw < pv.page.h ? 1.5 / s : 0), pv.page.h - y);
-      const cv = h('canvas', { class: 'tile' });
-      const st = cv.style;
-      st.left = x + 'px';
-      st.top = y + 'px';
-      st.width = w + 'px';
-      st.height = hh + 'px';
-      st.zIndex = String(10 + lvl);
-      pv.el.append(cv);
-      t = { key, cv, ctx: cv.getContext('2d'), pv, lvl, x, y, w, h: hh, s, dirty: true, used: 0 };
-      this.tiles.set(key, t);
-    }
-    const W = Math.max(1, Math.round(t.w * s)), H = Math.max(1, Math.round(t.h * s));
-    if (t.cv.width !== W || t.cv.height !== H) {
-      t.cv.width = W;
-      t.cv.height = H;
-    }
-    t.kx = W / t.w;
-    t.ky = H / t.h;
-    t.ctx.setTransform(t.kx, 0, 0, t.ky, -t.x * t.kx, -t.y * t.ky);
-    renderRegion(t.ctx, pv.page, { x: t.x, y: t.y, w: t.w, h: t.h }, s, { hidden: pv.hidden, assets: this.assets });
-    t.dirty = false;
-    t.used = now();
-  }
-  removeTile(key, t) {
-    t.cv.width = 0;
-    t.cv.height = 0;
-    t.cv.remove();
-    this.tiles.delete(key);
-  }
-  dropTiles(pv) {
-    for (const [k, t] of this.tiles) if (t.pv === pv) this.removeTile(k, t);
-  }
-  tilesOf(pv, bb) {
+  // bb（ページ座標）に掛かっているタイル
+  tilesFor(L, pv, bb, pad) {
+    const k = L.k, T = this.T;
+    const i0 = Math.floor(((pv.x + bb[0] - pad) * k) / T), i1 = Math.floor(((pv.x + bb[2] + pad) * k) / T);
+    const j0 = Math.floor(((pv.y + bb[1] - pad) * k) / T), j1 = Math.floor(((pv.y + bb[3] + pad) * k) / T);
     const out = [];
-    for (const t of this.tiles.values()) {
-      if (t.pv !== pv || t.dirty) continue;
-      if (bb && (bb[0] > t.x + t.w || bb[2] < t.x || bb[1] > t.y + t.h || bb[3] < t.y)) continue;
-      out.push(t);
+    if ((i1 - i0 + 1) * (j1 - j0 + 1) > L.tiles.size) {
+      for (const t of L.tiles.values()) if (t.i >= i0 && t.i <= i1 && t.j >= j0 && t.j <= j1) out.push(t);
+    } else {
+      for (let j = j0; j <= j1; j++) {
+        for (let i = i0; i <= i1; i++) {
+          const t = L.tiles.get(i + ',' + j);
+          if (t) out.push(t);
+        }
+      }
     }
     return out;
   }
   invalidatePage(pv) {
-    pv.dirty = true;
-    this.dropTiles(pv);
+    const L = this.layer;
+    if (L) for (const t of this.tilesFor(L, pv, [0, 0, pv.page.w, pv.page.h], 1)) t.dirty = true;
+    pv.pdirty = true;
     this.requestRender();
   }
+  invalidateAll() {
+    if (this.layer) for (const t of this.layer.tiles.values()) t.dirty = true;
+    for (const pv of this.pvs) pv.pdirty = true;
+    this.requestRender();
+  }
+  // ページの一部だけ描き直す（デバイスピクセルの境目に揃えるので継ぎ目が出ない）
   repaintRegion(pv, bb, pad = 2) {
     if (!bb || !isFinite(bb[0])) return;
-    if (pv.scale > 0 && !pv.dirty && pv.ctx) {
-      const sx = pv.sx, sy = pv.sy;
-      const x0 = Math.max(0, Math.floor((bb[0] - pad) * sx) / sx), y0 = Math.max(0, Math.floor((bb[1] - pad) * sy) / sy);
-      const x1 = Math.min(pv.page.w, Math.ceil((bb[2] + pad) * sx) / sx), y1 = Math.min(pv.page.h, Math.ceil((bb[3] + pad) * sy) / sy);
-      if (x1 > x0 && y1 > y0) {
-        pv.ctx.setTransform(sx, 0, 0, sy, 0, 0);
-        renderRegion(pv.ctx, pv.page, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, sx, { hidden: pv.hidden, assets: this.assets });
+    const opts = { hidden: pv.hidden, assets: this.assets };
+    const bx0 = Math.max(0, bb[0] - pad), by0 = Math.max(0, bb[1] - pad);
+    const bx1 = Math.min(pv.page.w, bb[2] + pad), by1 = Math.min(pv.page.h, bb[3] + pad);
+    if (bx1 <= bx0 || by1 <= by0) return;
+    const L = this.layer;
+    if (L) {
+      const k = L.k, T = this.T;
+      const X0 = Math.floor((pv.x + bx0) * k), Y0 = Math.floor((pv.y + by0) * k);
+      const X1 = Math.ceil((pv.x + bx1) * k), Y1 = Math.ceil((pv.y + by1) * k);
+      for (const t of this.tilesFor(L, pv, bb, pad)) {
+        if (t.dirty) continue;
+        const ax = Math.max(X0, t.i * T), ay = Math.max(Y0, t.j * T);
+        const ex = Math.min(X1, (t.i + 1) * T), ey = Math.min(Y1, (t.j + 1) * T);
+        if (ex <= ax || ey <= ay) continue;
+        const ctx = t.ctx;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(ax - t.i * T, ay - t.j * T, ex - ax, ey - ay);
+        ctx.setTransform(k, 0, 0, k, pv.x * k - t.i * T, pv.y * k - t.j * T);
+        const rx0 = Math.max(0, ax / k - pv.x), ry0 = Math.max(0, ay / k - pv.y);
+        const rx1 = Math.min(pv.page.w, ex / k - pv.x), ry1 = Math.min(pv.page.h, ey / k - pv.y);
+        if (rx1 > rx0 && ry1 > ry0) renderRegion(ctx, pv.page, { x: rx0, y: ry0, w: rx1 - rx0, h: ry1 - ry0 }, k, opts);
       }
-    } else this.requestRender();
-    const ex = [bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad];
-    for (const t of this.tilesOf(pv, ex)) {
-      const kx = t.kx, ky = t.ky;
-      const x0 = Math.max(t.x, t.x + Math.floor((ex[0] - t.x) * kx) / kx), y0 = Math.max(t.y, t.y + Math.floor((ex[1] - t.y) * ky) / ky);
-      const x1 = Math.min(t.x + t.w, t.x + Math.ceil((ex[2] - t.x) * kx) / kx), y1 = Math.min(t.y + t.h, t.y + Math.ceil((ex[3] - t.y) * ky) / ky);
-      if (x1 <= x0 || y1 <= y0) continue;
-      t.ctx.setTransform(kx, 0, 0, ky, -t.x * kx, -t.y * ky);
-      renderRegion(t.ctx, pv.page, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, t.s, { hidden: pv.hidden, assets: this.assets });
+    }
+    if (pv.ps && !pv.pdirty) {
+      const sx = pv.cv.width / pv.page.w, sy = pv.cv.height / pv.page.h;
+      const x0 = Math.floor(bx0 * sx) / sx, y0 = Math.floor(by0 * sy) / sy;
+      const x1 = Math.min(pv.page.w, Math.ceil(bx1 * sx) / sx), y1 = Math.min(pv.page.h, Math.ceil(by1 * sy) / sy);
+      const done = pv.prow / sy;
+      if (y0 < done) {
+        pv.pctx.setTransform(sx, 0, 0, sy, 0, 0);
+        renderRegion(pv.pctx, pv.page, { x: x0, y: y0, w: x1 - x0, h: Math.min(y1, done) - y0 }, sx, opts);
+      }
     }
   }
+  // 新しく増えたもの（書いた線・貼ったもの）を上から描き足す
   drawNew(pv, it) {
     const dark = isDarkColor(pv.page.paper);
-    if (pv.scale > 0 && !pv.dirty && pv.ctx) {
-      pv.ctx.setTransform(pv.sx, 0, 0, pv.sy, 0, 0);
-      drawItem(pv.ctx, it, dark, this.assets);
-    } else this.requestRender();
-    for (const t of this.tilesOf(pv, it.bb)) {
-      t.ctx.setTransform(t.kx, 0, 0, t.ky, -t.x * t.kx, -t.y * t.ky);
-      drawItem(t.ctx, it, dark, this.assets);
+    const L = this.layer;
+    if (L) {
+      const k = L.k, T = this.T;
+      for (const t of this.tilesFor(L, pv, it.bb, 2)) {
+        if (t.dirty) continue;
+        const ctx = t.ctx;
+        ctx.setTransform(k, 0, 0, k, pv.x * k - t.i * T, pv.y * k - t.j * T);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, pv.page.w, pv.page.h);
+        ctx.clip();
+        drawItem(ctx, it, dark, this.assets, k);
+        ctx.restore();
+      }
+    }
+    if (pv.ps && !pv.pdirty) {
+      const sx = pv.cv.width / pv.page.w, sy = pv.cv.height / pv.page.h;
+      const c = pv.pctx;
+      c.setTransform(sx, 0, 0, sy, 0, 0);
+      c.save();
+      c.beginPath();
+      c.rect(0, 0, pv.page.w, Math.min(pv.page.h, pv.prow / sy));
+      c.clip();
+      drawItem(c, it, dark, this.assets, sx);
+      c.restore();
     }
   }
   assetLoaded(id) {
@@ -864,6 +942,69 @@ export class Engine {
       if (pv.page.bg === id || pv.page.items.some((it) => it.t === 'i' && it.asset === id)) this.invalidatePage(pv);
     }
     if (this.sel && this.sel.items.some((it) => it.asset === id)) this.renderSelCanvas();
+  }
+
+  // ---- 予備の縮小版（重いページを素早くズームアウトしたとき、描き直すまでの間だけ見える）
+  schedulePreviews(delay = 400) {
+    clearTimeout(this._prevT);
+    this._prevT = setTimeout(() => this.previewTick(), delay);
+  }
+  previewTick() {
+    if (!this.loaded) return;
+    if (this.tg || this.anim || this.action || now() - this.lastViewChange < 300) return this.schedulePreviews();
+    const fi = this.focusIndex();
+    const deadline = now() + 4;
+    for (const i of [fi, fi + 1, fi - 1, fi + 2, fi - 2]) {
+      const pv = this.pvs[i];
+      if (pv && this.previewStep(pv, deadline)) return this.schedulePreviews(30);
+    }
+    this.pvs.forEach((pv, i) => {
+      if (Math.abs(i - fi) > 2 && pv.ps) {
+        pv.cv.width = pv.cv.height = 0;
+        pv.ps = 0;
+        pv.pdirty = true;
+      }
+    });
+  }
+  // 少しずつ（帯ごとに）描く。まだ残っていれば true
+  previewStep(pv, deadline) {
+    const page = pv.page;
+    if (!pv.ps || pv.pdirty) {
+      const ps = Math.min(1.25, Math.sqrt(PREVIEW_PX / (page.w * page.h)));
+      const W = Math.max(1, Math.round(page.w * ps)), H = Math.max(1, Math.round(page.h * ps));
+      if (pv.cv.width !== W || pv.cv.height !== H) {
+        pv.cv.width = W;
+        pv.cv.height = H;
+      }
+      if (!pv.pctx) pv.pctx = pv.cv.getContext('2d');
+      pv.ps = ps;
+      pv.pdirty = false;
+      pv.prow = 0;
+    }
+    const W = pv.cv.width, H = pv.cv.height;
+    if (pv.prow >= H) return false;
+    const sx = W / page.w, sy = H / page.h;
+    const opts = { hidden: pv.hidden, assets: this.assets };
+    while (pv.prow < H) {
+      if (now() > deadline) return true;
+      const y0 = pv.prow, y1 = Math.min(H, y0 + 48);
+      pv.pctx.setTransform(sx, 0, 0, sy, 0, 0);
+      renderRegion(pv.pctx, page, { x: 0, y: y0 / sy, w: page.w, h: (y1 - y0) / sy }, sx, opts);
+      pv.prow = y1;
+    }
+    return false;
+  }
+  // 閉じるアニメーション用のページ画像
+  pageImage(i, w) {
+    const pv = this.pvs[i];
+    if (!pv) return null;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = Math.round((w * pv.page.h) / pv.page.w);
+    const ctx = c.getContext('2d');
+    if (pv.ps && !pv.pdirty && pv.prow >= pv.cv.height) ctx.drawImage(pv.cv, 0, 0, c.width, c.height);
+    else renderPageTo(ctx, pv.page, c.width / pv.page.w, c.height / pv.page.h, { assets: this.assets });
+    return c;
   }
 
   // ink / fx レイヤー
@@ -1007,6 +1148,7 @@ export class Engine {
       const sp = this.sp(e);
       const pv = this.pvs[this.focusIndex()];
       const nz = clamp(z * Math.exp(-e.deltaY * 0.01), pv ? this.minZoomFor(pv) : 0.1, MAX_Z);
+      this.wheelZoomT = now();
       const w = this.toWorld(sp);
       this.setView(sp.x - w.x * nz, sp.y - w.y * nz, nz);
       this.hooks.onZoom && this.hooks.onZoom(nz);
@@ -1167,6 +1309,7 @@ export class Engine {
           } else this.settleView({ from });
         } else if (g.mode === 'pinch') {
           this.settleView();
+          this.requestRender(); // 指を離した瞬間に、今の倍率ちょうどで描き直す
           this.hooks.onZoomEnd && this.hooks.onZoomEnd();
         }
       } else this.rebaseGesture();
@@ -1419,30 +1562,37 @@ export class Engine {
     let bb;
     if (a.shape) {
       const pts = a.shape.pts;
+      // 確定後と同じパス（同じ補間）で描く
+      const path = strokePath(pts, hl, k, SHARP_KINDS.has(a.shape.kind));
+      a.shape.path = path;
       if (hl) {
         ctx.strokeStyle = a.o.color;
         ctx.lineWidth = a.o.w;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
-        ctx.stroke(buildLinePath(pts));
+        ctx.stroke(path);
       } else {
         ctx.fillStyle = a.o.color;
-        ctx.fill(buildInkPath(pts));
+        ctx.fill(path);
       }
       bb = computeBB(pts);
     } else {
       const tip = live.tip(pred);
+      // 本体とペン先を 1 つのパスにして 1 回で塗る（重なった縁が濃くならない＝確定後と同じ見た目）
+      let path = hl ? live.line : live.ink.path;
+      if (tip) {
+        path = new Path2D(path);
+        path.addPath(tip);
+      }
       if (hl) {
         ctx.strokeStyle = a.o.color;
         ctx.lineWidth = a.o.w;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
-        ctx.stroke(live.line);
-        if (tip) ctx.stroke(tip);
+        ctx.stroke(path);
       } else {
         ctx.fillStyle = a.o.color;
-        ctx.fill(live.ink.path);
-        if (tip) ctx.fill(tip);
+        ctx.fill(path);
       }
       // 描き直す範囲は「今のチャンク＋ペン先」だけ
       bb = live.cbb.slice();
@@ -1540,7 +1690,7 @@ export class Engine {
     const raw = a.live.raw;
     const n = raw.length >> 2;
     if (!a.scribble) {
-      if (!force && (n < 6 || n - a.scrN < 3)) return;
+      if (!force && (n < 8 || n - a.scrN < Math.max(3, n >> 5))) return;
       a.scrN = n;
       if (!detectScribble(raw, this.view.z, settings.scribbleSens)) return;
       a.scribble = true;
@@ -1593,10 +1743,10 @@ export class Engine {
         ctx.lineWidth = it.w;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
-        ctx.stroke(itemPath(it));
+        ctx.stroke(itemPath(it, k));
       } else {
         ctx.fillStyle = 'rgba(255,72,60,0.92)';
-        ctx.fill(itemPath(it));
+        ctx.fill(itemPath(it, k));
       }
       ctx.restore();
       this.markFx(pv, it.bb, 4);
@@ -1631,8 +1781,12 @@ export class Engine {
     const o = a.o;
     const it = { id: uid(), t: 's', k: o.kind, c: o.color, w: o.w, pts: Float32Array.from(pts) };
     if (o.kind === 'hl') it.a = o.alpha;
+    if (a.shape && SHARP_KINDS.has(a.shape.kind)) it.sh = 1; // 角のある図形は補間しない
     it.bb = computeBB(it.pts);
-    if (!a.shape && a.live.dense.length > 3) setItemPath(it, a.live.fullPath());
+    // 書いている時に表示していたパスをそのまま使う → ペンを離しても見た目が変わらない
+    const k = this.view.z * this.dpr;
+    if (a.shape) setItemPath(it, a.shape.path, k);
+    else if (a.live.dense.length > 3) setItemPath(it, a.live.fullPath(), k);
     this.beginEdit(pv);
     pv.page.items.push(it);
     this.commitEdits();
@@ -1716,7 +1870,8 @@ export class Engine {
       ctx.globalAlpha = 1;
     }
     ctx.fillStyle = a.o.color;
-    ctx.fill(buildInkPath(pts));
+    a.path = strokePath(pts, false, k, a.o.kind !== 'ellipse');
+    ctx.fill(a.path);
     ctx.restore();
     this.inkDirty = this.devRect(pv, computeBB(pts), 4);
   }
@@ -1729,6 +1884,8 @@ export class Engine {
     if ((bb[2] - bb[0]) * z < 6 && (bb[3] - bb[1]) * z < 6) return;
     const pv = a.pv;
     const it = { id: uid(), t: 's', k: 'pen', c: a.o.color, w: a.o.w, pts, bb };
+    if (a.o.kind !== 'ellipse') it.sh = 1;
+    if (a.path) setItemPath(it, a.path, z * this.dpr);
     if (a.closed && a.o.fill !== 'none') {
       it.f = a.o.color;
       it.fa = a.o.fill === 'solid' ? 1 : 0.2;
@@ -1773,7 +1930,7 @@ export class Engine {
     ctx.scale(sc, sc);
     ctx.globalAlpha = 0.8;
     const dark = isDarkColor(pv.page.paper);
-    for (const it of st.items) drawItem(ctx, it, dark, st.assets);
+    for (const it of st.items) drawItem(ctx, it, dark, st.assets, k * sc);
     ctx.restore();
     const b = st.bb;
     this.inkDirty = this.devRect(pv, [a.x + b[0] * sc, a.y + b[1] * sc, a.x + b[2] * sc, a.y + b[3] * sc], 4);
@@ -1988,8 +2145,8 @@ export class Engine {
   select(pv, items) {
     this.clearSelection();
     const el = h('canvas', { class: 'sel-canvas' });
-    this.world.append(el);
-    this.sel = { pv, items, bb: unionBB(items), m: { tx: 0, ty: 0, s: 1, r: 0 }, el, k: 1 };
+    this.overWorld.append(el);
+    this.sel = { pv, items, bb: unionBB(items), m: { tx: 0, ty: 0, s: 1, r: 0 }, el, k: 0, rect: null };
     pv.hidden = new Set(items);
     this.repaintRegion(pv, this.sel.bb, 3);
     this.renderSelCanvas();
@@ -1997,26 +2154,44 @@ export class Engine {
     this.updateSelUi();
     this.hooks.onSelection && this.hooks.onSelection(true);
   }
+  // 選択したものも、表示倍率ちょうどの解像度・デバイスピクセルに揃えて描く（見えている付近だけ）
+  selRegion() {
+    const s = this.sel, pad = 6;
+    const vr = this.nearRect(0.15);
+    const x0 = Math.max(s.pv.x + s.bb[0] - pad, vr.x), y0 = Math.max(s.pv.y + s.bb[1] - pad, vr.y);
+    const x1 = Math.min(s.pv.x + s.bb[2] + pad, vr.x + vr.w), y1 = Math.min(s.pv.y + s.bb[3] + pad, vr.y + vr.h);
+    return { x0, y0, x1: Math.max(x0 + 1 / this.view.z, x1), y1: Math.max(y0 + 1 / this.view.z, y1) };
+  }
+  selStale() {
+    const s = this.sel;
+    if (!s.rect || Math.abs(s.k - this.view.z * this.dpr) > 1e-9) return true;
+    const r = this.selRegion(), c = s.rect;
+    return r.x0 < c.x0 - 0.5 || r.y0 < c.y0 - 0.5 || r.x1 > c.x1 + 0.5 || r.y1 > c.y1 + 0.5;
+  }
   renderSelCanvas() {
     const s = this.sel;
     if (!s) return;
-    const pad = 6;
-    const x = s.bb[0] - pad, y = s.bb[1] - pad;
-    const w = s.bb[2] - s.bb[0] + pad * 2, hh = s.bb[3] - s.bb[1] + pad * 2;
-    const k = Math.max(0.3, Math.min(this.view.z * this.dpr, Math.sqrt(SEL_PX / (w * hh))));
-    const W = Math.max(1, Math.ceil(w * k)), H = Math.max(1, Math.ceil(hh * k));
+    const r = this.selRegion();
+    let k = this.view.z * this.dpr;
+    if ((r.x1 - r.x0) * (r.y1 - r.y0) * k * k > SEL_PX) k = Math.sqrt(SEL_PX / ((r.x1 - r.x0) * (r.y1 - r.y0)));
+    const X0 = Math.floor(r.x0 * k), Y0 = Math.floor(r.y0 * k);
+    const W = Math.max(1, Math.ceil(r.x1 * k) - X0), H = Math.max(1, Math.ceil(r.y1 * k) - Y0);
     s.el.width = W;
     s.el.height = H;
     const st = s.el.style;
-    st.left = s.pv.x + x + 'px';
-    st.top = s.pv.y + y + 'px';
-    st.width = w + 'px';
-    st.height = hh + 'px';
+    st.left = X0 / k + 'px';
+    st.top = Y0 / k + 'px';
+    st.width = W / k + 'px';
+    st.height = H / k + 'px';
+    // 回転・拡大の中心は選択範囲の中心
+    const cx = s.pv.x + (s.bb[0] + s.bb[2]) / 2, cy = s.pv.y + (s.bb[1] + s.bb[3]) / 2;
+    st.transformOrigin = `${cx - X0 / k}px ${cy - Y0 / k}px`;
     const ctx = s.el.getContext('2d');
-    ctx.setTransform(W / w, 0, 0, H / hh, (-x * W) / w, (-y * H) / hh);
+    ctx.setTransform(k, 0, 0, k, s.pv.x * k - X0, s.pv.y * k - Y0);
     const dark = isDarkColor(s.pv.page.paper);
-    for (const it of s.items) drawItem(ctx, it, dark, this.assets);
+    for (const it of s.items) drawItem(ctx, it, dark, this.assets, k);
     s.k = k;
+    s.rect = { x0: X0 / k, y0: Y0 / k, x1: (X0 + W) / k, y1: (Y0 + H) / k };
     this.applySelTransform();
   }
   applySelTransform() {
@@ -2281,7 +2456,7 @@ export class Engine {
     }
     ctx.setTransform(sc, 0, 0, sc, -x * sc, -y * sc);
     const dark = isDarkColor(s.pv.page.paper);
-    for (const it of s.items) drawItem(ctx, it, dark, this.assets);
+    for (const it of s.items) drawItem(ctx, it, dark, this.assets, sc);
     return cv;
   }
   selectAll() {
@@ -2566,7 +2741,6 @@ export class Engine {
     if (this.textEdit && !keep.has(this.textEdit.pv.page)) this.commitText();
     for (const pv of this.pvs) {
       if (keep.has(pv.page)) continue;
-      this.dropTiles(pv);
       pv.cv.width = 0;
       pv.cv.height = 0;
       pv.el.remove();
@@ -2575,7 +2749,6 @@ export class Engine {
     this.pvs = pages.map((p) => this.pvMap.get(p) || this.createPV(p));
     for (const pv of this.pvs) this.world.insertBefore(pv.el, this.ghost);
     this.layout();
-    this.updateVisibility();
     this.requestRender();
     if (this.sel) this.updateSelUi();
     this.hooks.onPages && this.hooks.onPages(this.pages());
@@ -2588,12 +2761,14 @@ export class Engine {
     const before = this.pages();
     const ref = before[clamp(index - 1, 0, before.length - 1)] || {};
     const pages = list.map((props) => {
+      const template = props.template ?? ref.template;
       const p = newPageData(this.note.id, {
-        template: props.template ?? ref.template,
+        template,
         paper: props.paper ?? ref.paper,
         w: props.w ?? ref.w,
         h: props.h ?? ref.h,
         bg: props.bg || null,
+        sp: props.sp !== undefined ? props.sp : template === ref.template ? ref.sp : null,
       });
       return p;
     });
@@ -2752,10 +2927,10 @@ export class Engine {
           ctx.lineWidth = it.w;
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
-          ctx.stroke(itemPath(it));
+          ctx.stroke(itemPath(it, k));
         } else {
           ctx.fillStyle = it.c;
-          ctx.fill(itemPath(it));
+          ctx.fill(itemPath(it, k));
         }
         ctx.restore();
       }
