@@ -329,11 +329,19 @@ export class Engine {
     return { minTx, maxTx, minTy, maxTy };
   }
   // ドラッグ中の範囲：横は最初〜最後のページ、縦は今のページ
-  dragBounds(z) {
+  // 移動できる範囲（from = 操作を始めたときのページ）
+  //  - 拡大してページが画面より広いとき：今のページの中だけ。端から先は引っ張ると重くなり、勢いでは隣へ行かない
+  //  - ページ全体が見えているとき：横は最初〜最後のページ（左右にめくれる）
+  isWide(pv, z) {
+    return pv.page.w * z > this.area().w * 1.05;
+  }
+  dragBounds(z, from) {
     const n = this.pvs.length;
     if (!n) return { minTx: 0, maxTx: 0, minTy: 0, maxTy: 0 };
+    const pv = this.pvs[from != null && this.pvs[from] ? from : this.focusIndex()];
+    const b = this.pageBounds(pv, z);
+    if (this.isWide(pv, z)) return b;
     const bF = this.pageBounds(this.pvs[0], z), bL = this.pageBounds(this.pvs[n - 1], z);
-    const b = this.pageBounds(this.pvs[this.focusIndex()], z);
     return { minTx: bL.minTx, maxTx: bF.maxTx, minTy: b.minTy, maxTy: b.maxTy };
   }
   focusIndex() {
@@ -540,7 +548,7 @@ export class Engine {
     if (!this.loaded || !this.pvs.length) return;
     const { tx, ty, z } = this.view;
     const A = this.area();
-    let i = this.focusIndex();
+    let i = opts.page != null && this.pvs[opts.page] ? opts.page : this.focusIndex();
     if (opts.vx && Math.abs(opts.vx) > 0.3) {
       const base = opts.from != null && this.pvs[opts.from] ? opts.from : i;
       if (this.pvs[base].page.w * z <= A.w * 1.05) i = clamp(base + (opts.vx < 0 ? 1 : -1), 0, this.pvs.length - 1);
@@ -581,8 +589,8 @@ export class Engine {
       let { tx, ty, z } = this.view;
       tx += vx * dt;
       ty += vy * dt;
-      const b = this.dragBounds(z);
-      const over = 60;
+      const b = this.dragBounds(z, from);
+      const over = 40;
       if (ty > b.maxTy || ty < b.minTy) {
         vy *= Math.pow(0.5, dt / 16);
         ty = clamp(ty, b.minTy - over, b.maxTy + over);
@@ -594,7 +602,8 @@ export class Engine {
       if (Math.abs(vx) + Math.abs(vy) < 0.03) {
         this.anim = 0;
         this.setView(tx, ty, z);
-        this.settleView({ from });
+        const pv = this.pvs[from];
+        this.settleView({ from, page: pv && this.isWide(pv, z) ? from : null });
         return;
       }
       this.anim = requestAnimationFrame(step);
@@ -1173,7 +1182,7 @@ export class Engine {
     }
     if (this.mousePan && this.mousePan.id === e.pointerId) {
       const m = this.mousePan;
-      const b = this.dragBounds(m.v0.z);
+      const b = this.dragBounds(m.v0.z, m.from);
       this.setView(rubber(m.v0.tx + e.clientX - m.x, b.minTx, b.maxTx, this.sw), rubber(m.v0.ty + e.clientY - m.y, b.minTy, b.maxTy, this.sh), m.v0.z);
       return;
     }
@@ -1213,7 +1222,7 @@ export class Engine {
     } else {
       const k = e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? this.sh : 1;
       const dx = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX, dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
-      const b = this.dragBounds(z);
+      const b = this.dragBounds(z, this._wheelFrom);
       this.setView(clamp(tx - dx * k, b.minTx - 40, b.maxTx + 40), clamp(ty - dy * k, b.minTy - 40, b.maxTy + 40), z);
     }
     clearTimeout(this._wheelT);
@@ -1283,7 +1292,8 @@ export class Engine {
     if (pts.length === 1) {
       const p = pts[0];
       const mode = this.tg && (this.tg.mode === 'pan' || this.tg.mode === 'pinch') ? 'pan' : 'pending';
-      this.tg = { mode, id: p.id, p0: { x: p.x, y: p.y }, v0: v, samples: [{ t: now(), x: p.x, y: p.y }] };
+      const from = this.tapSess && this.tapSess.from != null ? this.tapSess.from : this.focusIndex();
+      this.tg = { mode, id: p.id, p0: { x: p.x, y: p.y }, v0: v, samples: [{ t: now(), x: p.x, y: p.y }], from, axis: null };
     } else {
       const a = pts[0], b = pts[1];
       const c = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
@@ -1319,18 +1329,26 @@ export class Engine {
     const g = this.tg;
     if (!g) return;
     if (g.mode === 'pending') {
-      if (Math.hypot(t.x - g.p0.x, t.y - g.p0.y) < 8) return;
+      const dx = t.x - g.p0.x, dy = t.y - g.p0.y;
+      if (Math.hypot(dx, dy) < 8) return;
       g.mode = 'pan';
+      // ページ全体が見えているときは、縦に動かし始めたら縦だけ・横なら横だけに固定する
+      // （縦にスクロールしたつもりが少し斜めになって、ページがめくれてしまわないように）
+      const pv = this.pvs[g.from];
+      if (pv && !this.isWide(pv, this.view.z)) g.axis = Math.abs(dy) > Math.abs(dx) * 1.2 ? 'y' : Math.abs(dx) > Math.abs(dy) * 1.2 ? 'x' : null;
       g.p0 = { x: t.x, y: t.y };
       g.v0 = { ...this.view };
       g.samples = [];
     }
     if (g.mode === 'pan') {
       if (t.id !== g.id) return;
-      const b = this.dragBounds(g.v0.z);
-      const rawTx = g.v0.tx + t.x - g.p0.x;
-      this.setView(rubber(rawTx, b.minTx, b.maxTx, this.sw), rubber(g.v0.ty + t.y - g.p0.y, b.minTy, b.maxTy, this.sh), g.v0.z);
-      this.setPull(rawTx < b.minTx && this.focusIndex() === this.pvs.length - 1 ? b.minTx - rawTx : 0);
+      const b = this.dragBounds(g.v0.z, g.from);
+      const ddx = g.axis === 'y' ? 0 : t.x - g.p0.x, ddy = g.axis === 'x' ? 0 : t.y - g.p0.y;
+      const rawTx = g.v0.tx + ddx;
+      g.rawTx = rawTx;
+      g.dx = ddx;
+      this.setView(rubber(rawTx, b.minTx, b.maxTx, this.sw), rubber(g.v0.ty + ddy, b.minTy, b.maxTy, this.sh), g.v0.z);
+      this.setPull(rawTx < b.minTx && g.from === this.pvs.length - 1 ? b.minTx - rawTx : 0);
       const tn = now();
       g.samples.push({ t: tn, x: t.x, y: t.y });
       while (g.samples.length > 2 && tn - g.samples[0].t > 90) g.samples.shift();
@@ -1375,14 +1393,28 @@ export class Engine {
               vy = (l.y - f.y) / dt;
             }
           }
-          const pv = this.pvs[from != null ? from : this.focusIndex()];
-          const fitsX = pv && pv.page.w * this.view.z <= this.area().w * 1.05;
+          const fi = g.from != null ? g.from : from != null ? from : this.focusIndex();
+          const pv = this.pvs[fi];
+          const A = this.area();
+          if (g.axis === 'y') vx = 0;
+          if (g.axis === 'x') vy = 0;
           if (armed && !cancel) {
             this.hooks.onPullAdd && this.hooks.onPullAdd();
-          } else if (fitsX && Math.abs(vx) > 0.3 && Math.abs(vx) > Math.abs(vy) * 0.8) {
-            this.settleView({ vx, from });
-          } else if (Math.hypot(fitsX ? 0 : vx, vy) > 0.12) {
-            this.startInertia(fitsX ? 0 : vx, vy, from);
+          } else if (pv && !this.isWide(pv, this.view.z)) {
+            // ページ全体が見えているとき：速く・はっきり横に・ある程度の距離を払ったときだけページをめくる
+            if (Math.abs(vx) > 0.55 && Math.abs(vx) > Math.abs(vy) * 1.5 && Math.abs(g.dx || 0) > 40) this.settleView({ vx, from: fi });
+            else if (Math.abs(vy) > 0.12) this.startInertia(0, vy, fi);
+            else this.settleView({ from: fi });
+          } else if (pv) {
+            // 拡大中：ページの端からさらに大きく（画面の幅の 4 割以上）引っ張って離したときだけ隣のページへ。
+            // 勢い（慣性）は今のページの端で止まる
+            const b = this.dragBounds(this.view.z, fi);
+            const raw = g.rawTx != null ? g.rawTx : this.view.tx;
+            const over = raw > b.maxTx ? raw - b.maxTx : raw < b.minTx ? raw - b.minTx : 0;
+            const to = over > 0 ? fi - 1 : fi + 1;
+            if (Math.abs(over) > A.w * 0.4 && this.pvs[to]) this.settleView({ page: to });
+            else if (Math.hypot(vx, vy) > 0.12) this.startInertia(vx, vy, fi);
+            else this.settleView({ page: fi });
           } else this.settleView({ from });
         } else if (g.mode === 'pinch') {
           this.settleView();
