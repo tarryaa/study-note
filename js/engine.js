@@ -14,7 +14,7 @@ import { icon } from './icons.js';
 import { settings, saveSettings } from './settings.js';
 import {
   LiveStroke, strokePath, computeBB, hitStrokeCircle, hitStrokeSegment,
-  splitStroke, itemPath, setItemPath, PEN_TYPES, pointInPoly, convexHull, insideFraction, cutStrokeByPoly,
+  splitStroke, itemPath, setItemPath, PEN_TYPES, pointInPoly,
 } from './ink.js';
 import { detectScribble } from './scribble.js';
 import { recognizeShape, snapLineEnd, shapeGeometry } from './shapes.js';
@@ -23,7 +23,6 @@ import { newPageData, cloneItem } from './store.js';
 
 const GAP = 72; // ページ同士の間隔（横並び）
 export const MAX_Z = 10;
-const LIVE_COST = 12000; // ズーム中にフレームごとに描き直してよい重さの目安（見えている点の数）
 const PREVIEW_PX = 1.1e6; // 予備の縮小版 1 枚のピクセル数
 const SEL_PX = 10e6;
 const EDGE = 18; // 拡大時にページの端を寄せる位置（px）
@@ -131,6 +130,7 @@ export class Engine {
     this.tcss = 0;
     this.maxTiles = 60;
     this.wheelZoomT = 0;
+    this.lastZoomChange = 0;
     this.animZoom = false;
     this.tool = 'pen';
     this.accent = '#5b6cf0';
@@ -428,6 +428,7 @@ export class Engine {
     tx = Math.round(tx * d) / d;
     ty = Math.round(ty * d) / d;
     const v = this.view;
+    if (z !== v.z) this.lastZoomChange = now();
     v.tx = tx;
     v.ty = ty;
     v.z = z;
@@ -662,24 +663,10 @@ export class Engine {
     this._rq = 0;
     this.renderTick();
   }
+  // ズーム操作の最中か（ピンチ中でも、指が止まって 0.1 秒たてば「止まった」とみなしてすぐ描き直す）
   isZooming() {
-    return !!((this.tg && this.tg.mode === 'pinch') || (this.anim && this.animZoom) || now() - this.wheelZoomT < 220);
-  }
-  // 見えている部分の描画の重さ（点の数など）→ ズーム中に毎フレーム描き直せるかの見積もりに使う
-  visibleCost() {
-    const vr = this.visibleRect();
-    let c = 0;
-    for (const pv of this.pvs) {
-      if (!overlap(this.pvRect(pv), vr)) continue;
-      c += 150;
-      const x0 = vr.x - pv.x, y0 = vr.y - pv.y, x1 = x0 + vr.w, y1 = y0 + vr.h;
-      for (const it of pv.page.items) {
-        const b = it.bb;
-        if (b[0] > x1 || b[2] < x0 || b[1] > y1 || b[3] < y0) continue;
-        c += it.t === 's' ? it.pts.length / 3 + 4 : 60;
-      }
-    }
-    return c;
+    const tn = now();
+    return !!((this.tg && this.tg.mode === 'pinch' && tn - this.lastZoomChange < 110) || (this.anim && this.animZoom) || tn - this.wheelZoomT < 220);
   }
   renderTick() {
     this._rq = 0;
@@ -687,17 +674,17 @@ export class Engine {
     const k = this.view.z * this.dpr;
     let L = this.layer;
     if (!L || L.k !== k) {
-      const zooming = L && this.isZooming();
-      // 重さ = 見えている点の数 ＋ タイル 1 枚あたりの手間
-      // （描画は GPU 側で後から実行されるので JS の計測時間はあてにならない。固定の目安で判断する）
-      if (!zooming || this.visibleCost() + this.visibleTileCount() * 250 <= LIVE_COST) {
-        this.rebuildLayer(k);
-      } else {
-        // 重いページのズーム中：今のタイルを拡大縮小して見せ、操作が終わったら描き直す
+      if (L && this.isZooming()) {
+        // ズームの操作中は、今のタイルをそのまま拡大縮小して見せる（毎フレーム全部描き直すと指への追従が重くなる）。
+        // 倍率の変化が小さいうちは、新しく見えた所だけ今のタイルと同じ解像度で描き足す。
+        // 指が止まる・離れる・アニメーションが終わると、その瞬間の倍率ちょうどで一度に描き直す
+        const sc = k / L.k;
+        if (sc > 0.8 && sc < 1.25) this.fillVisible(L);
         clearTimeout(this._zoomT);
         this._zoomT = setTimeout(() => this.requestRender(), 120);
         return;
       }
+      this.rebuildLayer(k);
       L = this.layer;
     }
     this.fillVisible(L);
@@ -717,15 +704,16 @@ export class Engine {
     L.el.style.transform = `translate3d(${tx}px, ${ty}px, 0)` + (Math.abs(s - 1) > 1e-9 ? ` scale(${s})` : '');
   }
   // 画面（＋余白 pad デバイスピクセル）に掛かるタイル番号の範囲。タイルはワールド座標 × k の空間に並ぶ
-  tileSpan(padX = 0, padY = 0) {
+  // sc = 表示倍率 ÷ タイルの倍率（ズーム操作中にタイルを拡大縮小して見せているときの倍率）
+  tileSpan(padX = 0, padY = 0, sc = 1) {
     const T = this.T, d = this.dpr;
     const ox = Math.round(this.view.tx * d), oy = Math.round(this.view.ty * d);
     const W = Math.round(this.sw * d), H = Math.round(this.sh * d);
     return {
-      i0: Math.floor((-ox - padX) / T),
-      i1: Math.floor((W - ox + padX - 1) / T),
-      j0: Math.floor((-oy - padY) / T),
-      j1: Math.floor((H - oy + padY - 1) / T),
+      i0: Math.floor((-ox / sc - padX) / T),
+      i1: Math.floor(((W - ox) / sc + padX - 1) / T),
+      j0: Math.floor((-oy / sc - padY) / T),
+      j1: Math.floor(((H - oy) / sc + padY - 1) / T),
     };
   }
   visibleTileCount() {
@@ -797,7 +785,7 @@ export class Engine {
   }
   // 見えているタイルは必ずその場で描く（描きかけ・低画質の状態を見せない）
   fillVisible(L) {
-    const s = this.tileSpan();
+    const s = this.tileSpan(0, 0, (this.view.z * this.dpr) / L.k);
     for (let j = s.j0; j <= s.j1; j++) {
       for (let i = s.i0; i <= s.i1; i++) {
         const t = L.tiles.get(i + ',' + j);
@@ -1186,7 +1174,10 @@ export class Engine {
     if (!this.touches.size && !this.fingerDraws()) {
       const tn = now();
       if (tn - (this.lastPenUp || 0) < 350 || tn - (this.lastPenHover || 0) < 200) return;
-      if (e.width > 70 && e.height > 70) return;
+      // 接地面がとても大きいものだけ手のひらとみなす（素早く動かした指は接地面が大きめになり、
+      // 指として扱われずに 2 本指ズームが効かなくなることがあったため）
+      const big = e.width > 0 && e.height > 0 ? Math.min(e.width, e.height) : 0;
+      if (big > 110 || (big > 60 && tn - (this.lastPenUp || 0) < 1500)) return;
     }
     const sp = this.sp(e);
     this.touches.set(e.pointerId, { id: e.pointerId, x: sp.x, y: sp.y, sx: sp.x, sy: sp.y });
@@ -1725,7 +1716,7 @@ export class Engine {
   // ぐしゃぐしゃ判定：高精度入力の線と、本体のイベントだけの線の「両方」がぐしゃぐしゃに見えるときだけ
   // （片方の入力データがおかしくても、普通の字を消してしまわないように）
   isScribble(a, info) {
-    const z = this.view.z, sens = settings.scribbleSens;
+    const z = this.view.z, sens = settings.scribbleLevel;
     const r1 = detectScribble(a.live.raw, z, sens, info);
     return r1 && a.track.length >= 32 && detectScribble(a.track, z, sens);
   }
@@ -1763,24 +1754,18 @@ export class Engine {
     }
   }
   // 消える予定の線を赤く表示（実際に消える範囲と同じ見た目に）
+  // 消える予定の線を赤く表示（触れた線はまるごと消える）
   drawTargets(a) {
-    const pv = a.pv, raw = a.live.raw;
-    const xy = [];
-    for (let i = 0; i < raw.length; i += 4) xy.push(raw[i], raw[i + 1]);
-    const hull = convexHull(xy);
-    const hp = new Path2D();
-    for (let i = 0; i < hull.length; i += 2) hp[i ? 'lineTo' : 'moveTo'](hull[i], hull[i + 1]);
-    hp.closePath();
+    const pv = a.pv;
     this.clearFx();
     const ctx = this.fxCtx;
     const [k, ox, oy] = this.inkTransform(pv);
     ctx.setTransform(k, 0, 0, k, ox, oy);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, pv.page.w, pv.page.h);
+    ctx.clip();
     for (const it of a.targets) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(0, 0, pv.page.w, pv.page.h);
-      ctx.clip();
-      if (hull.length >= 6 && insideFraction(it, hull, 3) < 0.45) ctx.clip(hp);
       if (it.k === 'hl') {
         ctx.strokeStyle = 'rgba(255,72,60,0.45)';
         ctx.lineWidth = it.w;
@@ -1791,16 +1776,16 @@ export class Engine {
         ctx.fillStyle = 'rgba(255,72,60,0.92)';
         ctx.fill(itemPath(it, k));
       }
-      ctx.restore();
       this.markFx(pv, it.bb, 4);
     }
+    ctx.restore();
   }
   // 不具合調査用：最近の数本の線の入力データ（設定 → 入力データをコピー）
   logStroke(a, info) {
     if (!this.inputLog) this.inputLog = [];
     const tr = [];
     for (let i = 0; i < a.track.length; i += 4) tr.push(Math.round(a.track[i] * 100) / 100, Math.round(a.track[i + 1] * 100) / 100, Math.round(a.track[i + 3]));
-    this.inputLog.push({ at: new Date().toISOString(), z: +this.view.z.toFixed(3), sens: settings.scribbleSens, scribble: !!a.scribble, info, dropped: a.dropped, rawN: a.live.raw.length >> 2, track: tr, events: a.log });
+    this.inputLog.push({ at: new Date().toISOString(), z: +this.view.z.toFixed(3), level: settings.scribbleLevel, scribble: !!a.scribble, info, dropped: a.dropped, rawN: a.live.raw.length >> 2, track: tr, events: a.log });
     if (this.inputLog.length > 3) this.inputLog.shift();
   }
   inputLogText() {
@@ -1857,35 +1842,15 @@ export class Engine {
     this.resetInkStyle();
     this.markDirty(pv.page);
   }
-  // ぐしゃぐしゃ消し：ほぼ覆われた線は丸ごと、通り抜けているだけの長い線は覆った部分だけ消す
   scribbleErase(pv, targets, raw) {
-    const xy = [];
-    for (let i = 0; i < raw.length; i += 4) xy.push(raw[i], raw[i + 1]);
-    const hull = convexHull(xy);
-    const whole = [], partial = new Map();
-    for (const it of targets) {
-      const f = hull.length >= 6 ? insideFraction(it, hull) : 1;
-      if (f >= 0.45) whole.push(it);
-      else partial.set(it, cutStrokeByPoly(it, hull));
-    }
-    const wholeSet = new Set(whole);
+    // ぐしゃぐしゃが触れた線は、一部だけでなく線全体を消す
+    const set = new Set(targets);
     this.beginEdit(pv);
-    const next = [];
-    for (const it of pv.page.items) {
-      if (wholeSet.has(it)) continue;
-      const frags = partial.get(it);
-      if (frags) {
-        for (const f of frags) next.push({ ...it, id: uid(), pts: f, bb: computeBB(f), f: undefined, fa: undefined });
-      } else next.push(it);
-    }
-    pv.page.items = next;
+    pv.page.items = pv.page.items.filter((it) => !set.has(it));
     this.commitEdits();
     this.repaintRegion(pv, unionBB(targets), 3);
     this.markDirty(pv.page);
-    const hp = new Path2D();
-    for (let i = 0; i < hull.length; i += 2) hp[i ? 'lineTo' : 'moveTo'](hull[i], hull[i + 1]);
-    hp.closePath();
-    this.dissolve(pv, targets, raw, new Set(partial.keys()), hp);
+    this.dissolve(pv, targets, raw, null, null);
   }
 
   // ---------------------------------------------------------------- 図形ツール

@@ -1,5 +1,5 @@
 // 「ぐしゃぐしゃ書き」検出（スクリブルで消去）
-// raw: [x, y, p, t, ...]（ページ座標） z: 表示倍率  sens: 0 控えめ / 1 ふつう / 2 敏感
+// raw: [x, y, p, t, ...]（ページ座標） z: 表示倍率  level: 感度 1（控えめ）〜 10（敏感）
 //
 // 「あ」「ぬ」「め」のような交差やループのある普通の字では反応しないように:
 //  - 手ぶれ・細かいカーブを拾わないよう、線の大きさに応じた許容誤差で折れ線に単純化してから調べる
@@ -8,14 +8,28 @@
 //    字の中にたまたまある 1〜2 回の折り返し・ゆるい曲がり・ループは数えない
 //  - ぐるぐる：同じ向きに何周も回っていて、しかも同じ場所に重なっている（線の長さ ≫ 大きさ）場合だけ
 //  - 回転量は「向きつき」で合計するので、手ぶれの左右の揺れは打ち消し合って溜まらない
-const PARAMS = [
-  // 控えめ（はっきり何度も往復したときだけ）
-  { rev: 6, cos: -0.84, ratio: 3.2, loops: 4, loopRatio: 8, speed: 0.3 },
-  // ふつう
-  { rev: 4, cos: -0.76, ratio: 2.6, loops: 3, loopRatio: 6.5, speed: 0.2 },
-  // 敏感
-  { rev: 3, cos: -0.68, ratio: 2.2, loops: 2.5, loopRatio: 5.5, speed: 0.12 },
-];
+// 感度 1（控えめ）〜 10（敏感）。数字が大きいほど、少ない往復・ゆるい折り返しで反応する
+//   rev   : 続けて必要な往復（折り返し）の回数
+//   cos   : 折り返しとみなす向きの変化（-1 = 真逆）
+//   ratio : 線の長さ ÷ 大きさ（同じ所を行き来しているほど大きい）
+//   loops / loopRatio : ぐるぐるの周回数と、そのときの長さ ÷ 大きさ
+//   speed : 平均の速さ（画面上 px/ms）
+const LEVELS = {
+  rev: [6, 5, 5, 4, 4, 4, 3, 3, 2, 2],
+  cos: [-0.9, -0.88, -0.86, -0.84, -0.82, -0.8, -0.78, -0.75, -0.72, -0.68],
+  ratio: [3.6, 3.4, 3.2, 3.0, 2.8, 2.7, 2.6, 2.4, 2.2, 2.0],
+  loops: [4.5, 4, 4, 3.5, 3.5, 3, 3, 2.5, 2.5, 2],
+  loopRatio: [9, 8.5, 8, 7.5, 7, 6.5, 6, 5.5, 5, 4.5],
+  speed: [0.35, 0.32, 0.3, 0.28, 0.25, 0.22, 0.2, 0.17, 0.14, 0.12],
+};
+export function scribbleParams(level) {
+  const x = Math.min(9, Math.max(0, (+level || 6) - 1));
+  const i = Math.min(8, Math.floor(x)), f = x - i;
+  const P = {};
+  for (const k in LEVELS) P[k] = LEVELS[k][i] + (LEVELS[k][i + 1] - LEVELS[k][i]) * f;
+  P.rev = Math.round(P.rev);
+  return P;
+}
 
 // 折れ線への単純化（Douglas–Peucker、x,y のみ）。残った点の番号を返す
 function simplifyIdx(raw, n, tol) {
@@ -52,7 +66,7 @@ function simplifyIdx(raw, n, tol) {
   return out;
 }
 
-export function detectScribble(raw, z, sens = 1, info = null) {
+export function detectScribble(raw, z, level = 6, info = null) {
   // 途中で間が空いた所（ペンが離れていた所）があれば、そこから後ろだけを 1 本の線として調べる
   let n = raw.length >> 2;
   for (let i = n - 1; i > 0; i--) {
@@ -63,7 +77,7 @@ export function detectScribble(raw, z, sens = 1, info = null) {
     }
   }
   if (n < 8) return false;
-  const P = PARAMS[sens] || PARAMS[1];
+  const P = scribbleParams(level);
   // 長さ・範囲・速さ
   let len = 0;
   let x0 = raw[0], y0 = raw[1], x1 = x0, y1 = y0;

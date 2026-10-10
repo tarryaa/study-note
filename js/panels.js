@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.3.1';
+export const VERSION = '1.4.0';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -64,8 +64,16 @@ export function openSettings(app) {
       '手書き',
       ui.row('予測描画', ui.toggle(settings.prediction, set('prediction')), 'ペン先の少し先まで線を描いて、遅れを感じにくくします'),
       ui.row('指で描く', ui.segmented([{ value: 'auto', label: '自動' }, { value: 'on', label: 'オン' }, { value: 'off', label: 'オフ' }], settings.fingerDraw, (v) => { set('fingerDraw')(v); app.editor.updateFinger(); }), '自動：Apple Pencil を使うと、指はスクロールとズーム専用になります'),
-      ui.row('ぐしゃぐしゃ書きで消す', ui.toggle(settings.scribble, set('scribble')), '一筆で何度も往復（ジグザグ・ぐるぐる）すると、その下の線が消えます。普通の字では反応しません'),
-      ui.row('消すときの感度', ui.segmented([{ value: 0, label: '控えめ' }, { value: 1, label: 'ふつう' }, { value: 2, label: '敏感' }], settings.scribbleSens, set('scribbleSens'))),
+      ui.row('ぐしゃぐしゃ書きで消す', ui.toggle(settings.scribble, set('scribble')), '一筆で何度も往復（ジグザグ・ぐるぐる）すると、触れた線がまるごと消えます。普通の字では反応しません'),
+      ui.row(
+        '消すときの感度',
+        ui.slider({
+          min: 1, max: 10, step: 1, value: settings.scribbleLevel,
+          format: (v) => `${v}・${v <= 3 ? '控えめ' : v <= 7 ? 'ふつう' : '敏感'}`,
+          onInput: (v) => { settings.scribbleLevel = v; saveSettings(); },
+        }),
+        '数字を上げるほど、少ない往復ですぐ消えます（上げすぎると字の一部に反応しやすくなります）'
+      ),
       ui.row('止めると図形に補正', ui.toggle(settings.holdShape, set('holdShape')), '線を描いたままペンを止めると、直線・円・四角などに整えます'),
       ui.row('2本指タップで元に戻す', ui.toggle(settings.twoFingerUndo, set('twoFingerUndo')), '3本指タップでやり直し'),
       ui.row('消しゴムの後ペンに戻る', ui.toggle(settings.autoRevert, set('autoRevert')))
@@ -108,7 +116,7 @@ export function openSettings(app) {
 
 const GESTURES = [
   ['pen', 'Apple Pencil で書く', '筆圧で太さが変わります。指はスクロール・ズーム用（ヘッダーの手のボタンで切替）'],
-  ['sparkle', 'ぐしゃぐしゃっと消す', 'ペンを離さず一筆で、消したい所を何度も往復（ジグザグ・ぐるぐる）すると線が消えます。下を通る長い線は覆った部分だけ消えます。間違えて消えたときは「元に戻す」で戻せます。反応しすぎる／しにくいときは設定の「消すときの感度」で調整'],
+  ['sparkle', 'ぐしゃぐしゃっと消す', 'ペンを離さず一筆で、消したい所を何度も往復（ジグザグ・ぐるぐる）すると、触れた線がまるごと消えます。間違えて消えたときは「元に戻す」で戻せます。反応の速さは設定の「消すときの感度」（1〜10）で調整'],
   ['shapes', '止めると図形に', '直線・弧・曲線・折れ線・円・四角・三角を描いてペンを止めると整います。そのまま動かすと大きさや向きを調整できます'],
   ['shapes', '図形ツール', 'ツールバーの図形から、矢印・星・多角形などをドラッグで描けます。塗りや縦横比固定も選べます'],
   ['pages', 'ページは横に並ぶ', '左右にスワイプでページ移動。最後のページでさらに左へ引っ張ると新しいページが追加されます'],

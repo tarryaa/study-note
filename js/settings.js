@@ -19,7 +19,7 @@ export const DEFAULTS = {
   fingerDraw: 'auto', // auto | on | off
   penSeen: false,
   scribble: true,
-  scribbleSens: 1, // 0 低 / 1 中 / 2 高
+  scribbleLevel: 6, // ぐしゃぐしゃ消しの感度 1（控えめ）〜 10（敏感）
   holdShape: true,
   prediction: true,
   twoFingerUndo: true,
@@ -59,7 +59,11 @@ function merge(d, s) {
 
 function load() {
   try {
-    return merge(DEFAULTS, JSON.parse(localStorage.getItem(KEY) || '{}'));
+    const raw = JSON.parse(localStorage.getItem(KEY) || '{}');
+    const s = merge(DEFAULTS, raw);
+    // 以前の 3 段階（控えめ / ふつう / 敏感）からの引き継ぎ。前より少ない往復で反応する段階にする
+    if (raw && raw.scribbleLevel == null && raw.scribbleSens != null) s.scribbleLevel = [5, 6, 8][raw.scribbleSens] || 6;
+    return s;
   } catch (_) {
     return merge(DEFAULTS, {});
   }
