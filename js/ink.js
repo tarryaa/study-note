@@ -307,12 +307,21 @@ export function simplify(pts, tol) {
 const P_TAU = 26; // 筆圧の平滑化の時定数（ms）
 const P_TAU0 = 8; // 書き始め（ペン先が付いた直後）は素早く追従
 const R_SLOPE = 0.3; // 太さの変化の上限（半径の変化 / 進んだ距離）
+// 手ぶれ補正（One Euro フィルタ）：ゆっくり書いているときほど強くならし、速く書いているときは弱める
+// （手ぶれが目立つのはゆっくり書いたとき。速いときに強くならすと線がペンから遅れて見えるため）
+//  stab = 0（オフ）〜 10（最強）。数字が大きいほど、ならす周波数（Hz）が低くなる
+const stabCutoff = (stab) => 9 * Math.pow(0.774, stab - 1);
+const lowpass = (fc, dt) => 1 / (1 + 1 / (2 * Math.PI * fc * dt));
+
 export class LiveStroke {
-  constructor({ kind, w, sens = 1, z = 1 }) {
+  constructor({ kind, w, sens = 1, z = 1, stab = 0 }) {
     this.kind = kind;
     this.w = w;
     this.sens = sens;
     this.z = z;
+    this.stab = Math.max(0, Math.min(10, +stab || 0));
+    this.ax = null; // 実際のペン先（手ぶれ補正前）
+    this.ay = null;
     this.raw = []; // x, y, p, t
     this.dense = []; // x, y, r（平滑化済み）
     this.tol = 0.05 / z;
@@ -330,7 +339,34 @@ export class LiveStroke {
   rad(p) {
     return this.kind === 'hl' ? this.w / 2 : radiusFor(this.w, p, this.sens);
   }
+  // 手ぶれ補正をかけた位置を返す（実際のペン先は ax, ay に覚えておく）
+  stabilize(x, y, t) {
+    this.ax = x;
+    this.ay = y;
+    if (!this.stab) return [x, y];
+    if (this.sx == null) {
+      this.sx = this.px = x;
+      this.sy = this.py = y;
+      this.sv = 0;
+      this.st = t;
+      return [x, y];
+    }
+    let dt = (t - this.st) / 1000;
+    if (!(dt > 0)) dt = 1 / 240;
+    if (dt > 0.1) dt = 0.1;
+    this.st = t;
+    // 画面上の速さ（px/秒）
+    const sp = (Math.hypot(x - this.px, y - this.py) * this.z) / dt;
+    this.px = x;
+    this.py = y;
+    this.sv += lowpass(4, dt) * (sp - this.sv);
+    const a = lowpass(stabCutoff(this.stab) + 0.03 * Math.pow(0.92, this.stab - 1) * this.sv, dt);
+    this.sx += a * (x - this.sx);
+    this.sy += a * (y - this.sy);
+    return [this.sx, this.sy];
+  }
   add(x, y, p, t) {
+    [x, y] = this.stabilize(x, y, t);
     const raw = this.raw;
     if (this.ps < 0) {
       this.ps = p;
@@ -402,7 +438,11 @@ export class LiveStroke {
     const lx = raw[L - 4], ly = raw[L - 3];
     const lr = this.kind === 'hl' ? this.w / 2 : this.limitR(this.rad(this.ps), lx, ly);
     const out = [[lx, ly, lr]];
-    if (pred) for (const q of pred) out.push([q[0], q[1], lr]);
+    // 手ぶれ補正中は、ならした線の先から実際のペン先までつないで表示する（線がペンから遅れて見えない）
+    const act = this.actualTip(lx, ly, lr);
+    if (act) out.push(act);
+    const pr = act ? act[2] : lr;
+    if (pred) for (const q of pred) out.push([q[0], q[1], pr]);
     return out;
   }
   // 凍結していない部分（つなぎ目は 1 区間だけ重ねる）＋ペン先 のパス
@@ -443,10 +483,23 @@ export class LiveStroke {
     const raw = this.raw, L = raw.length;
     return L ? [raw[L - 4], raw[L - 3], this.rad(this.ps)] : null;
   }
+  // ならした線の先 (lx, ly, lr) から実際のペン先への点（補正なし・ほぼ同じ位置なら null）
+  actualTip(lx, ly, lr) {
+    if (!this.stab || this.ax == null || Math.abs(this.ax - lx) + Math.abs(this.ay - ly) < 1e-4) return null;
+    if (this.kind === 'hl') return [this.ax, this.ay, this.w / 2];
+    const lim = R_SLOPE * Math.hypot(this.ax - lx, this.ay - ly) + 1e-4;
+    const r = this.rad(this.ps);
+    return [this.ax, this.ay, r > lr + lim ? lr + lim : r < lr - lim ? lr - lim : r];
+  }
   finish() {
     const raw = this.raw, L = raw.length;
     if (!L) return;
     if (L >> 2 >= 2) this.emit(raw[L - 4], raw[L - 3], this.rad(this.ps), true);
+    // 手ぶれ補正中は、線の終わりをペンを離した位置まで伸ばす
+    const d = this.dense, n = d.length;
+    if (n && this.stab && this.ax != null && Math.abs(this.ax - d[n - 3]) + Math.abs(this.ay - d[n - 2]) >= 1e-4) {
+      this.emit(this.ax, this.ay, this.rad(this.ps), true);
+    }
   }
   points() {
     const tol = this.kind === 'hl' ? 0.2 / this.z : Math.min(0.1, 0.06 / this.z);

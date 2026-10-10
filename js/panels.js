@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.5.1';
+export const VERSION = '1.5.2';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -88,6 +88,15 @@ export function openSettings(app) {
     ),
     ui.section(
       '手書き',
+      ui.row(
+        '手ぶれ補正',
+        ui.slider({
+          min: 0, max: 10, step: 1, value: settings.stabilize ?? 3,
+          format: (v) => (v === 0 ? 'オフ' : `${v}・${v <= 3 ? '弱' : v <= 6 ? '中' : '強'}`),
+          onInput: (v) => { settings.stabilize = v; saveSettings(); },
+        }),
+        '手の震えによる線のガタつきをならします。強くするほどなめらかになりますが、ゆっくり書いたとき線の形がペンの動きより少し丸くなります（線はペン先まで表示され、書き終わりはペンを離した位置まで伸びます）'
+      ),
       ui.row('予測描画', ui.toggle(settings.prediction, set('prediction')), 'ペン先の少し先まで線を描いて、遅れを感じにくくします'),
       ui.row('指で描く', ui.segmented([{ value: 'auto', label: '自動' }, { value: 'on', label: 'オン' }, { value: 'off', label: 'オフ' }], settings.fingerDraw, (v) => { set('fingerDraw')(v); app.editor.updateFinger(); }), '自動：Apple Pencil を使うと、指はスクロールとズーム専用になります'),
       ui.row('ぐしゃぐしゃ書きで消す', ui.toggle(settings.scribble, set('scribble')), '一筆で何度も往復（ジグザグ・ぐるぐる）すると、触れた線がまるごと消えます。普通の字では反応しません'),

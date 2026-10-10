@@ -21,6 +21,7 @@ export const DEFAULTS = {
   scribble: true,
   scribbleLevel: 6, // ぐしゃぐしゃ消しの感度 1（控えめ）〜 10（敏感）
   holdShape: true,
+  stabilize: 3, // 手ぶれ補正 0（オフ）〜 10（最強）
   prediction: true,
   twoFingerUndo: true,
   autoRevert: false,

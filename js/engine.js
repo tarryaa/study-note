@@ -1598,7 +1598,7 @@ export class Engine {
   }
   beginStroke(base, pv, e) {
     const o = this.strokeOpts();
-    const live = new LiveStroke({ kind: o.kind, w: o.w, sens: o.sens, z: this.view.z });
+    const live = new LiveStroke({ kind: o.kind, w: o.w, sens: o.sens, z: this.view.z, stab: settings.stabilize });
     const a = (this.action = {
       ...base, kind: 'stroke', pv, live, o, scribble: false, targets: null, scrN: 0, scrTested: 1, shape: null, holdT: 0, anchor: null,
       lastT: -Infinity, seen: new Set(), seenQ: [], dropped: 0, track: [], log: [],
