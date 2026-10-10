@@ -1085,8 +1085,8 @@ export class Engine {
       this.hooks.onPenDetected && this.hooks.onPenDetected();
     }
   }
-  pressureOf(ev) {
-    if (ev.pointerType !== 'pen') return 0.3;
+  pressureOf(ev, type) {
+    if ((ev.pointerType || type) !== 'pen') return 0.3;
     const p = ev.pressure;
     if (p > 0 && p !== 0.5) this.realPressure = true;
     if (!(p > 0)) return 0.12;
@@ -1470,7 +1470,10 @@ export class Engine {
   beginStroke(base, pv, e) {
     const o = this.strokeOpts();
     const live = new LiveStroke({ kind: o.kind, w: o.w, sens: o.sens, z: this.view.z });
-    const a = (this.action = { ...base, kind: 'stroke', pv, live, o, scribble: false, targets: null, scrN: 0, scrTested: 1, shape: null, holdT: 0, anchor: null });
+    const a = (this.action = {
+      ...base, kind: 'stroke', pv, live, o, scribble: false, targets: null, scrN: 0, scrTested: 1, shape: null, holdT: 0, anchor: null,
+      lastT: -Infinity, seen: new Set(), seenQ: [], dropped: 0, track: [], log: [],
+    });
     const st = this.inkWrap.style;
     if (o.kind === 'hl') {
       st.opacity = String(o.alpha);
@@ -1484,25 +1487,55 @@ export class Engine {
       this.drawLive(a, null);
       return;
     }
-    this.feed(a, [e]);
+    this.feed(a, [e], e);
     this.drawLive(a, null);
     if (settings.holdShape) this.armHold(a, this.sp(e));
   }
-  feed(a, evs) {
+  // 入力点を線に加える
+  //  - iPad Safari の高精度入力（coalesced events）は新しい機能で、時刻や属性が欠けることがある。
+  //    時刻は本体のイベントの時刻を基準に付け直し、同じ点が二重に届いたもの・古い点が後から届いたものは捨てる
+  //    （線を往復でなぞり直したようなデータになって、ぐしゃぐしゃ消しの誤判定の原因になるため）
+  //  - 判定用に、本体のイベント（1 回の通知につき 1 点）だけの記録 track も別に取っておく
+  feed(a, evs, e) {
     const pv = a.pv;
     const { tx, ty, z } = this.view;
     const L = this.rect.left, T = this.rect.top;
-    for (const ev of evs) a.live.add((ev.clientX - L - tx) / z - pv.x, (ev.clientY - T - ty) / z - pv.y, this.pressureOf(ev), ev.timeStamp);
+    const T0 = e.timeStamp, last = evs[evs.length - 1].timeStamp;
+    const rec = [Math.round(T0), evs.length];
+    for (const ev of evs) {
+      const d = last - ev.timeStamp;
+      const t = d >= 0 && d < 250 ? T0 - d : T0;
+      const x = (ev.clientX - L - tx) / z - pv.x, y = (ev.clientY - T - ty) / z - pv.y;
+      rec.push(Math.round(x * 100) / 100, Math.round(y * 100) / 100, Math.round(ev.timeStamp * 10) / 10);
+      if (!isFinite(x) || !isFinite(y) || t < a.lastT - 0.5) {
+        a.dropped++;
+        continue;
+      }
+      const key = Math.round(x * 256) + ',' + Math.round(y * 256);
+      if (a.seen.has(key)) {
+        a.dropped++;
+        continue;
+      }
+      a.seen.add(key);
+      a.seenQ.push(key);
+      if (a.seenQ.length > 256) a.seen.delete(a.seenQ.shift());
+      if (t > a.lastT) a.lastT = t;
+      a.live.add(x, y, this.pressureOf(ev, e.pointerType), t);
+    }
+    if (a.log.length < 300) a.log.push(rec);
+    const mx = (e.clientX - L - tx) / z - pv.x, my = (e.clientY - T - ty) / z - pv.y;
+    const tr = a.track, n = tr.length;
+    if (isFinite(mx) && isFinite(my) && (!n || (T0 > tr[n - 1] && (mx !== tr[n - 4] || my !== tr[n - 3])))) tr.push(mx, my, 0, T0);
   }
   moveStroke(a, e) {
     const evs = coalesced(e);
     // ペンを離した通知が届かずに次の線を書き始めた場合（間が空いて、離れた場所から急に続く）は、
     // 前の線をそこで確定して新しい線として書き始める（2 本の線が 1 本につながらないように）
-    const raw = a.live.raw, RL = raw.length;
-    if (RL && e.pointerType === 'pen' && !a.shape) {
-      const ev0 = evs[0];
-      const [x, y] = this.localPt(ev0, a.pv);
-      if (ev0.timeStamp - raw[RL - 1] > 110 && Math.hypot(x - raw[RL - 4], y - raw[RL - 3]) * this.view.z > 10) {
+    // （判定には信頼できる本体のイベントの時刻と位置だけを使う）
+    const tr = a.track, TL = tr.length;
+    if (TL && e.pointerType === 'pen' && !a.shape) {
+      const [x, y] = this.localPt(e, a.pv);
+      if (e.timeStamp - tr[TL - 1] > 110 && Math.hypot(x - tr[TL - 4], y - tr[TL - 3]) * this.view.z > 10) {
         this.endAction(a, null, false);
         this.begin(e);
         return;
@@ -1514,7 +1547,7 @@ export class Engine {
       this.drawLive(a, null);
       return;
     }
-    this.feed(a, evs);
+    this.feed(a, evs, e);
     if (settings.scribble && a.o.kind === 'pen') this.checkScribble(a);
     const pred = settings.prediction && !a.scribble ? this.predict(a, e) : null;
     this.drawLive(a, pred);
@@ -1689,13 +1722,20 @@ export class Engine {
   }
 
   // ---- ぐしゃぐしゃ消し
+  // ぐしゃぐしゃ判定：高精度入力の線と、本体のイベントだけの線の「両方」がぐしゃぐしゃに見えるときだけ
+  // （片方の入力データがおかしくても、普通の字を消してしまわないように）
+  isScribble(a, info) {
+    const z = this.view.z, sens = settings.scribbleSens;
+    const r1 = detectScribble(a.live.raw, z, sens, info);
+    return r1 && a.track.length >= 32 && detectScribble(a.track, z, sens);
+  }
   checkScribble(a, force) {
     const raw = a.live.raw;
     const n = raw.length >> 2;
     if (!a.scribble) {
       if (!force && (n < 8 || n - a.scrN < Math.max(3, n >> 5))) return;
       a.scrN = n;
-      if (!detectScribble(raw, this.view.z, settings.scribbleSens)) return;
+      if (!this.isScribble(a)) return;
       a.scribble = true;
       a.targets = new Set();
       a.scrTested = 1;
@@ -1755,18 +1795,37 @@ export class Engine {
       this.markFx(pv, it.bb, 4);
     }
   }
+  // 不具合調査用：最近の数本の線の入力データ（設定 → 入力データをコピー）
+  logStroke(a, info) {
+    if (!this.inputLog) this.inputLog = [];
+    const tr = [];
+    for (let i = 0; i < a.track.length; i += 4) tr.push(Math.round(a.track[i] * 100) / 100, Math.round(a.track[i + 1] * 100) / 100, Math.round(a.track[i + 3]));
+    this.inputLog.push({ at: new Date().toISOString(), z: +this.view.z.toFixed(3), sens: settings.scribbleSens, scribble: !!a.scribble, info, dropped: a.dropped, rawN: a.live.raw.length >> 2, track: tr, events: a.log });
+    if (this.inputLog.length > 3) this.inputLog.shift();
+  }
+  inputLogText() {
+    return JSON.stringify({ ua: navigator.userAgent, dpr: this.dpr, strokes: this.inputLog || [] });
+  }
   endStroke(a) {
     clearTimeout(a.holdT);
     clearTimeout(a.predT);
     const pv = a.pv;
     // 書き終わった時点でもう一度ぐしゃぐしゃ判定（途中で判定しきれなかった場合）
     if (!a.scribble && !a.shape && settings.scribble && a.o.kind === 'pen') this.checkScribble(a, true);
+    // 書き終わった線全体でもう一度確認。ぐしゃぐしゃに見えなくなっていたら、普通の線として残す
+    const info = {};
+    if (a.scribble && !this.isScribble(a, info)) {
+      a.scribble = false;
+      a.targets = null;
+      this.clearFx();
+      this.resetInkStyle();
+    }
+    this.logStroke(a, info);
     if (a.scribble && a.targets && a.targets.size) {
       const targets = [...a.targets];
       this.clearInk();
       this.resetInkStyle();
       this.scribbleErase(pv, targets, a.live.raw);
-      this.hooks.onScribbleErase && this.hooks.onScribbleErase(targets.length);
       return;
     }
     this.clearFx();

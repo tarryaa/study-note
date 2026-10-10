@@ -82,6 +82,18 @@ export function openSettings(app) {
       'このアプリについて',
       ui.row('バージョン', h('span', { class: 'muted', text: VERSION })),
       ui.row('使い方', btn('表示', () => openHelp())),
+      ui.row('不具合の調査用データ', btn('コピー', async () => {
+        const text = app.editor.engine.inputLogText();
+        try {
+          await navigator.clipboard.writeText(text);
+          ui.toast('コピーしました', { icon: 'copy' });
+        } catch (_) {
+          const ta = h('textarea', { class: 'input', readonly: '', style: { height: '240px', fontSize: '11px' } });
+          ta.value = text;
+          ui.sheet({ title: '調査用データ', body: ta });
+          setTimeout(() => ta.select(), 300);
+        }
+      }), '直近に書いた 3 本の線の入力データ（ペンの位置と時刻）。うまく動かないときに送ってもらうと原因を調べられます'),
       ui.row('設定をリセット', btn('リセット', async () => {
         const ok = await ui.confirmDialog({ title: '設定をリセットしますか？', message: 'ペンの色や太さ、表示の設定が初期状態に戻ります（ノートは消えません）。', ok: 'リセット', danger: true });
         if (ok) {

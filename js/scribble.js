@@ -52,7 +52,7 @@ function simplifyIdx(raw, n, tol) {
   return out;
 }
 
-export function detectScribble(raw, z, sens = 1) {
+export function detectScribble(raw, z, sens = 1, info = null) {
   // 途中で間が空いた所（ペンが離れていた所）があれば、そこから後ろだけを 1 本の線として調べる
   let n = raw.length >> 2;
   for (let i = n - 1; i > 0; i--) {
@@ -78,6 +78,7 @@ export function detectScribble(raw, z, sens = 1) {
   const diag = Math.hypot(x1 - x0, y1 - y0);
   if (diag * z < 14 || len * z < 70) return false;
   const ratio = len / diag;
+  if (info) info.ratio = +ratio.toFixed(2);
   if (ratio < Math.min(P.ratio, P.loopRatio)) return false;
   const dt = raw[(n - 1) * 4 + 3] - raw[3];
   if (dt > 0 && (len * z) / dt < P.speed) return false;
@@ -110,14 +111,19 @@ export function detectScribble(raw, z, sens = 1) {
     const p = long[j - 1], q = long[j];
     const cos = (p.dx * q.dx + p.dy * q.dy) / (p.L * q.L);
     const similar = Math.min(p.L, q.L) / Math.max(p.L, q.L) >= 0.3;
-    const quick = q.dt <= 450 && p.dt <= 450;
+    // 1 往復ぶんには必ず時間がかかる（時間 0 で戻る＝入力データの重複なので数えない）
+    const quick = p.dt > 0 && q.dt > 0 && q.dt <= 450 && p.dt <= 450;
     if (cos < P.cos && similar && quick) {
       run++;
       if (run > best) best = run;
     } else run = 0;
   }
+  const loops = Math.abs(turn) / (Math.PI * 2);
+  if (info) {
+    info.run = best;
+    info.loops = +loops.toFixed(2);
+  }
   if (best >= P.rev && ratio >= P.ratio) return true;
   // ぐるぐる：同じ向きに何周も、同じ場所で回っている
-  const loops = Math.abs(turn) / (Math.PI * 2);
   return loops >= P.loops && ratio >= P.loopRatio;
 }
