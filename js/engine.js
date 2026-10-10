@@ -188,9 +188,66 @@ export class Engine {
       if (!this.isUi(e.target)) e.preventDefault();
     });
     st.addEventListener('dblclick', (e) => e.preventDefault());
+    this.bindOutsideTouches();
   }
   isUi(t) {
     return !!(t && t.closest && t.closest('button, input, textarea, select, [data-ui]'));
+  }
+  // ツールバー・ヘッダー・ページボタンの上に乗った指も、2 本指ズームの指として使う
+  //  - 画面の上で指 1 本の操作中に、もう 1 本がツールバーの上に置かれた → その指も加えてピンチにする
+  //  - 先にツールバーの上に指を置いて、すぐ画面の上にもう 1 本 → 同じくピンチにする
+  //  使った指のボタンは押されたことにしない
+  bindOutsideTouches() {
+    const out = (this.outside = new Map());
+    const joinable = (t) => !!(t && t.closest && !this.stage.contains(t) && t.closest('.ed-head, .dock-wrap, .page-nav, .zoom-ind') && !t.closest('.dock-grip'));
+    document.addEventListener('pointerdown', (e) => {
+      if (e.pointerType !== 'touch' || !this.loaded || !joinable(e.target)) return;
+      const sp = this.sp(e);
+      const o = { id: e.pointerId, x: sp.x, y: sp.y, t0: now(), adopted: false };
+      out.set(e.pointerId, o);
+      this.logTouch(e, 'outside');
+      if (this.touches.size >= 1 && !this.action) this.adoptTouch(o);
+    }, true);
+    document.addEventListener('pointermove', (e) => {
+      const o = out.get(e.pointerId);
+      if (!o) return;
+      const sp = this.sp(e);
+      o.x = sp.x;
+      o.y = sp.y;
+      if (o.adopted) this.touchMove(e);
+    }, true);
+    const up = (e) => {
+      const o = out.get(e.pointerId);
+      if (!o) return;
+      out.delete(e.pointerId);
+      if (o.adopted) {
+        this.noClickUntil = now() + 600;
+        this.touchUp(e, e.type === 'pointercancel');
+      }
+    };
+    document.addEventListener('pointerup', up, true);
+    document.addEventListener('pointercancel', up, true);
+    document.addEventListener('click', (e) => {
+      if (now() < (this.noClickUntil || 0) && !this.stage.contains(e.target)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, true);
+  }
+  adoptTouch(o) {
+    if (o.adopted || this.touches.has(o.id)) return;
+    o.adopted = true;
+    this.touches.set(o.id, { id: o.id, x: o.x, y: o.y, sx: o.x, sy: o.y });
+    if (this.tapSess) this.tapSess.max = Math.max(this.tapSess.max, this.touches.size);
+    this.stopAnim();
+    this.rebaseGesture();
+  }
+  // 不具合調査用：最近の指の操作（設定 → 不具合の調査用データ）
+  logTouch(e, what) {
+    if (!this.touchLog) this.touchLog = [];
+    const tn = now();
+    this.touchLog.push([Math.round(tn), e.pointerId, what, Math.round(e.width || 0), Math.round(e.height || 0), this.touches.size, this.tg ? this.tg.mode : '-', Math.round(tn - (this.lastPenUp || 0)), Math.round(tn - (this.lastPenHover || 0))]);
+    if (this.touchLog.length > 80) this.touchLog.shift();
   }
 
   onResize() {
@@ -1170,15 +1227,19 @@ export class Engine {
   // ---------------------------------------------------------------- 指（パン・ピンチ・タップ）
   touchDown(e) {
     if (this.action && this.action.pointerType === 'pen') return; // 書いている間の手のひらは無視
-    // ペンを離した直後・ペンが浮いている間に置かれた指は手のひらとみなす
+    // 手のひらの判定（指を手のひらと間違えて捨てると 2 本指ズームが効かなくなるので、確実なものだけ）
+    //  - ペンを離した瞬間（0.15 秒以内）に置かれたもの
+    //  - 接地面がとても大きいもの。ペンが浮いている間・書いた直後は、やや大きいものも
+    //  （以前は「ペンが画面の近くにある間の指はすべて手のひら」としていたため、
+    //    ペンを持ったままズームすると指が無視されることがあった）
     if (!this.touches.size && !this.fingerDraws()) {
       const tn = now();
-      if (tn - (this.lastPenUp || 0) < 350 || tn - (this.lastPenHover || 0) < 200) return;
-      // 接地面がとても大きいものだけ手のひらとみなす（素早く動かした指は接地面が大きめになり、
-      // 指として扱われずに 2 本指ズームが効かなくなることがあったため）
-      const big = e.width > 0 && e.height > 0 ? Math.min(e.width, e.height) : 0;
-      if (big > 110 || (big > 60 && tn - (this.lastPenUp || 0) < 1500)) return;
-    }
+      const size = e.width > 0 && e.height > 0 ? Math.min(e.width, e.height) : 0;
+      const penNear = tn - (this.lastPenHover || 0) < 150 || tn - (this.lastPenUp || 0) < 1000;
+      const why = tn - (this.lastPenUp || 0) < 150 ? 'pen-up' : size > 110 ? 'size' : size > 70 && penNear ? 'size+pen' : '';
+      this.logTouch(e, why || 'ok');
+      if (why) return;
+    } else this.logTouch(e, 'ok');
     const sp = this.sp(e);
     this.touches.set(e.pointerId, { id: e.pointerId, x: sp.x, y: sp.y, sx: sp.x, sy: sp.y });
     if (!this.tapSess) this.tapSess = { t0: now(), max: 0, moved: false, drew: false, sp, from: this.focusIndex() };
@@ -1190,6 +1251,16 @@ export class Engine {
         try { this.stage.setPointerCapture(e.pointerId); } catch (_) {}
         this.begin(e);
         return;
+      }
+    }
+    // 少し前にツールバーなどの上に置かれた指があれば、一緒にピンチの指にする
+    if (this.outside && !this.action) {
+      for (const o of this.outside.values()) {
+        if (!o.adopted && now() - o.t0 < 700) {
+          o.adopted = true;
+          this.touches.set(o.id, { id: o.id, x: o.x, y: o.y, sx: o.x, sy: o.y });
+          this.tapSess.max = Math.max(this.tapSess.max, this.touches.size);
+        }
       }
     }
     const a = this.action;
@@ -1270,6 +1341,8 @@ export class Engine {
       const d = Math.max(10, Math.hypot(A.x - B.x, A.y - B.y));
       const pv = this.pvs[this.focusIndex()];
       const z = softZoom((g.v0.z * d) / g.d0, pv ? this.minZoomFor(pv) : 0.1);
+      // 少しでもピンチしたら「2 本指タップ（元に戻す）」とはみなさない
+      if (this.tapSess && (Math.abs(d - g.d0) > 6 || Math.hypot(c.x - g.c0.x, c.y - g.c0.y) > 6)) this.tapSess.moved = true;
       this.lastPinchC = c;
       this.setView(c.x - g.w.x * z, c.y - g.w.y * z, z);
       this.hooks.onZoom && this.hooks.onZoom(z);
@@ -1789,7 +1862,7 @@ export class Engine {
     if (this.inputLog.length > 3) this.inputLog.shift();
   }
   inputLogText() {
-    return JSON.stringify({ ua: navigator.userAgent, dpr: this.dpr, strokes: this.inputLog || [] });
+    return JSON.stringify({ ua: navigator.userAgent, dpr: this.dpr, strokes: this.inputLog || [], touches: this.touchLog || [] });
   }
   endStroke(a) {
     clearTimeout(a.holdT);

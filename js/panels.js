@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.4.0';
+export const VERSION = '1.4.1';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -101,7 +101,7 @@ export function openSettings(app) {
           ui.sheet({ title: '調査用データ', body: ta });
           setTimeout(() => ta.select(), 300);
         }
-      }), '直近に書いた 3 本の線の入力データ（ペンの位置と時刻）。うまく動かないときに送ってもらうと原因を調べられます'),
+      }), '直近に書いた 3 本の線と、最近の指の操作の入力データ（位置と時刻）。うまく動かないときに送ってもらうと原因を調べられます'),
       ui.row('設定をリセット', btn('リセット', async () => {
         const ok = await ui.confirmDialog({ title: '設定をリセットしますか？', message: 'ペンの色や太さ、表示の設定が初期状態に戻ります（ノートは消えません）。', ok: 'リセット', danger: true });
         if (ok) {
