@@ -1,7 +1,6 @@
 // 手書きストロークの幾何計算
-//  - 筆圧つき可変幅ストロークを「円 + 接線台形」の和集合として 1 つの Path2D にする
-//    （全サブパスの向きを揃えているので nonzero 塗りで穴・欠けが出ない）
-//  - ライブ描画用のスムージング（中点二次ベジェ）と、確定時の間引き（Douglas–Peucker）
+//  - 筆圧つき可変幅ストロークを、縁が重ならない 1 本の閉じた輪郭（アウトライン）にする
+//  - ライブ描画用のスムージング（筆圧の時間平滑化・中点二次ベジェ）と、確定時の間引き（Douglas–Peucker）
 //  - 消しゴム用の当たり判定・分割
 // 点列は Float32Array [x, y, r, x, y, r, ...]（r = 半径、ページ座標）
 
@@ -18,126 +17,137 @@ export function radiusFor(w, p, sens) {
   return Math.max(w * 0.07, w * 0.5 * (1 + (f - 1) * sens));
 }
 
-const TAU = Math.PI * 2;
-function circle(P, x, y, r) {
-  P.moveTo(x + r, y);
-  P.arc(x, y, r, 0, TAU, true); // 反時計回り＝台形と同じ向き
-  P.closePath();
-}
-
-// 可変幅ストロークのパスを逐次組み立てる
-export class InkPath {
-  constructor() {
-    this.path = new Path2D();
-    this.n = 0;
-    this.x = 0; this.y = 0; this.r = 0;
-    this.q = false; // 直前に台形があるか
-    this.circled = false; // 現在の端点に円があるか
-    this.a1x = 0; this.a1y = 0; this.a2x = 0; this.a2y = 0;
-  }
-  push(x, y, r) {
-    const P = this.path;
-    if (this.n === 0) {
-      circle(P, x, y, r);
-      this.x = x; this.y = y; this.r = r; this.n = 1; this.circled = true; this.q = false;
-      return;
-    }
-    const dx = x - this.x, dy = y - this.y;
-    const d = Math.hypot(dx, dy);
-    if (d < 1e-4) {
-      if (r > this.r) { circle(P, x, y, r); this.r = r; this.circled = true; this.q = false; }
-      return;
-    }
-    const sa = (this.r - r) / d;
-    if (sa >= 0.999 || sa <= -0.999) {
-      // 一方の円がもう一方を包含 → 台形は不要
-      if (sa <= -0.999) circle(P, x, y, r);
-      this.x = x; this.y = y; this.r = r; this.n++;
-      this.q = false; this.circled = true;
-      return;
-    }
-    const ca = Math.sqrt(1 - sa * sa);
-    const ux = dx / d, uy = dy / d;
-    const n1x = ux * sa - uy * ca, n1y = uy * sa + ux * ca;
-    const n2x = ux * sa + uy * ca, n2y = uy * sa - ux * ca;
-    // 関節の隙間（外側のくさび）が見える大きさなら円で埋める
-    if (this.q && !this.circled) {
-      const c1 = n1x * this.a1x + n1y * this.a1y;
-      const c2 = n2x * this.a2x + n2y * this.a2y;
-      const k = 0.02 / this.r;
-      if (Math.min(c1, c2) < 1 - 0.5 * k * k) circle(P, this.x, this.y, this.r);
-    }
-    const lx = this.x, ly = this.y, lr = this.r;
-    P.moveTo(lx + n1x * lr, ly + n1y * lr);
-    P.lineTo(x + n1x * r, y + n1y * r);
-    P.lineTo(x + n2x * r, y + n2y * r);
-    P.lineTo(lx + n2x * lr, ly + n2y * lr);
-    P.closePath();
-    this.a1x = n1x; this.a1y = n1y; this.a2x = n2x; this.a2y = n2y;
-    this.q = true; this.circled = false;
-    this.x = x; this.y = y; this.r = r; this.n++;
-  }
-  cap() {
-    if (this.n > 0 && !this.circled) {
-      circle(this.path, this.x, this.y, this.r);
-      this.circled = true;
-    }
-  }
-}
-
-// 確定済みストロークは SVG パス文字列から Path2D を作る
-// （Path2D のメソッドを数千回呼ぶより桁違いに速い。InkPath と同じ形状・同じ向き）
+// ---------- 輪郭（アウトライン）の生成 ----------
+// 以前は「点ごとの円 ＋ 円をつなぐ台形」を重ねて塗っていた。
+// これだと筆圧のわずかな揺れで円が 1 つずつ膨らんで縁が数珠つなぎ（点々）になり、
+// iPad の描画エンジンでは円と台形の縁が重なる所だけ輪郭が濃くなって、点が並んだように見えていた。
+// → 線全体を「左の縁 → 先端の丸 → 右の縁 → 始端の丸」の 1 本の閉じた輪郭として作る。
+//   縁が重ならないので、どの倍率でも 1 本のなめらかな線になる。
+//   曲がり角は、外側を円弧でつなぎ、内側は中心を経由してつなぐ（一般的なストローク描画と同じ方式。nonzero で塗る）
 const fx = (v) => Math.round(v * 1000) / 1000;
 function svgCircle(out, x, y, r) {
   const R = fx(r);
   out.push(`M${fx(x + r)} ${fx(y)}A${R} ${R} 0 1 0 ${fx(x - r)} ${fx(y)}A${R} ${R} 0 1 0 ${fx(x + r)} ${fx(y)}Z`);
 }
-export function buildInkPath(pts) {
-  const n = pts.length / 3;
+
+// P = [x, y, r, ...] の i0〜i1 番目（＋ extra の点）を 1 本の輪郭にした SVG パス文字列
+// cap0 / cap1: 始端・終端を丸くする（false なら平らに切る：書いている途中の継ぎ目用）
+//  - なだらかな所：前後の向きの二等分線方向へ、その点の太さだけずらした点を結ぶ（太さの変化がそのまま縁になる）
+//  - 角（向きが 18° 以上変わる所）：外側は円弧、内側は中心を経由してつなぐ
+const COS_SMOOTH = Math.cos((18 * Math.PI) / 180);
+export function outlineSvg(P, i0, i1, extra, cap0 = true, cap1 = true) {
+  const X = [], Y = [], R = [];
+  const add = (x, y, r) => {
+    const n = X.length;
+    if (n && Math.abs(x - X[n - 1]) + Math.abs(y - Y[n - 1]) < 1e-4) {
+      if (r > R[n - 1]) R[n - 1] = r;
+      return;
+    }
+    X.push(x);
+    Y.push(y);
+    R.push(r);
+  };
+  for (let i = i0; i <= i1; i++) add(P[i * 3], P[i * 3 + 1], P[i * 3 + 2]);
+  if (extra) for (const q of extra) add(q[0], q[1], q[2]);
+  const n = X.length;
   const out = [];
-  let x = 0, y = 0, r = 0, q = false, circled = false;
-  let a1x = 0, a1y = 0, a2x = 0, a2y = 0;
-  for (let i = 0; i < n; i++) {
-    const px = pts[i * 3], py = pts[i * 3 + 1], pr = pts[i * 3 + 2];
-    if (i === 0) {
-      svgCircle(out, px, py, pr);
-      x = px; y = py; r = pr; circled = true;
-      continue;
-    }
-    const dx = px - x, dy = py - y, d = Math.hypot(dx, dy);
-    if (d < 1e-4) {
-      if (pr > r) { svgCircle(out, px, py, pr); r = pr; circled = true; q = false; }
-      continue;
-    }
-    const sa = (r - pr) / d;
-    if (sa >= 0.999 || sa <= -0.999) {
-      if (sa <= -0.999) svgCircle(out, px, py, pr);
-      x = px; y = py; r = pr; q = false; circled = true;
-      continue;
-    }
-    const ca = Math.sqrt(1 - sa * sa), ux = dx / d, uy = dy / d;
-    const n1x = ux * sa - uy * ca, n1y = uy * sa + ux * ca;
-    const n2x = ux * sa + uy * ca, n2y = uy * sa - ux * ca;
-    if (q && !circled) {
-      const k = 0.02 / r;
-      if (Math.min(n1x * a1x + n1y * a1y, n2x * a2x + n2y * a2y) < 1 - 0.5 * k * k) svgCircle(out, x, y, r);
-    }
-    out.push(`M${fx(x + n1x * r)} ${fx(y + n1y * r)}L${fx(px + n1x * pr)} ${fx(py + n1y * pr)}L${fx(px + n2x * pr)} ${fx(py + n2y * pr)}L${fx(x + n2x * r)} ${fx(y + n2y * r)}Z`);
-    a1x = n1x; a1y = n1y; a2x = n2x; a2y = n2y;
-    q = true; circled = false;
-    x = px; y = py; r = pr;
+  if (!n) return '';
+  if (n === 1) {
+    svgCircle(out, X[0], Y[0], R[0]);
+    return out[0];
   }
-  if (n && !circled) svgCircle(out, x, y, r);
-  return new Path2D(out.join(''));
+  const m = n - 1;
+  const ux = new Float64Array(m), uy = new Float64Array(m);
+  for (let s = 0; s < m; s++) {
+    const dx = X[s + 1] - X[s], dy = Y[s + 1] - Y[s], d = Math.hypot(dx, dy);
+    ux[s] = dx / d;
+    uy[s] = dy / d;
+  }
+  // 各頂点：なだらかなら二等分線方向のずらし量（左側。右側は逆向き）
+  const smooth = new Uint8Array(n), mx = new Float64Array(n), my = new Float64Array(n);
+  for (let j = 1; j < m; j++) {
+    const c = ux[j - 1] * ux[j] + uy[j - 1] * uy[j];
+    if (c < COS_SMOOTH) continue;
+    let bx = -uy[j - 1] - uy[j], by = ux[j - 1] + ux[j];
+    const bl = Math.hypot(bx, by);
+    const f = R[j] / (bl * Math.sqrt((1 + c) / 2));
+    smooth[j] = 1;
+    mx[j] = bx * f;
+    my[j] = by * f;
+  }
+  const L = (x, y) => out.push(`L${fx(x)} ${fx(y)}`);
+  const A = (r, x, y) => out.push(`A${fx(r)} ${fx(r)} 0 0 0 ${fx(x)} ${fx(y)}`);
+  // 中心 q・半径 r の円周上を、向き n0 から n1 まで負の向きに回る円弧
+  // （90° を超える円弧は 2 つに分ける：半円をそのまま書くと丸め誤差で弧が小さくなるため）
+  const arc = (qx, qy, r, n0x, n0y, n1x, n1y) => {
+    const dot = n0x * n1x + n0y * n1y, cr = n0x * n1y - n0y * n1x;
+    if (dot < 0.2) {
+      const h = Math.atan2(cr < 0 ? -cr : cr, dot) / 2;
+      const c = Math.cos(h), sn = Math.sin(h);
+      A(r, qx + (n0x * c + n0y * sn) * r, qy + (-n0x * sn + n0y * c) * r);
+    }
+    A(r, qx + n1x * r, qy + n1y * r);
+  };
+  // 角：たどる向きで縁の向きが n0 → n1 に変わる。外側（負の回転）なら円弧、内側は中心を経由
+  const join = (qx, qy, r, n0x, n0y, n1x, n1y) => {
+    const tx = qx + n1x * r, ty = qy + n1y * r;
+    const dot = n0x * n1x + n0y * n1y;
+    if (dot > 0.9998) return L(tx, ty);
+    if (n0x * n1y - n0y * n1x < 0) arc(qx, qy, r, n0x, n0y, n1x, n1y);
+    else {
+      if (dot < 0.94) L(qx, qy);
+      L(tx, ty);
+    }
+  };
+  // 左の縁（前向き）。左の法線 = (-uy, ux)
+  out.push(`M${fx(X[0] - uy[0] * R[0])} ${fx(Y[0] + ux[0] * R[0])}`);
+  for (let j = 1; j < m; j++) {
+    if (smooth[j]) L(X[j] + mx[j], Y[j] + my[j]);
+    else {
+      L(X[j] - uy[j - 1] * R[j], Y[j] + ux[j - 1] * R[j]);
+      join(X[j], Y[j], R[j], -uy[j - 1], ux[j - 1], -uy[j], ux[j]);
+    }
+  }
+  const e = m - 1;
+  L(X[m] - uy[e] * R[m], Y[m] + ux[e] * R[m]);
+  // 先端（半円）。右の法線 = (uy, -ux)
+  if (cap1) {
+    A(R[m], X[m] + ux[e] * R[m], Y[m] + uy[e] * R[m]);
+    A(R[m], X[m] + uy[e] * R[m], Y[m] - ux[e] * R[m]);
+  } else L(X[m] + uy[e] * R[m], Y[m] - ux[e] * R[m]);
+  // 右の縁（後ろ向き）
+  for (let j = m - 1; j >= 1; j--) {
+    if (smooth[j]) L(X[j] - mx[j], Y[j] - my[j]);
+    else {
+      L(X[j] + uy[j] * R[j], Y[j] - ux[j] * R[j]);
+      join(X[j], Y[j], R[j], uy[j], -ux[j], uy[j - 1], -ux[j - 1]);
+    }
+  }
+  L(X[0] + uy[0] * R[0], Y[0] - ux[0] * R[0]);
+  // 始端（半円）
+  if (cap0) {
+    A(R[0], X[0] - ux[0] * R[0], Y[0] - uy[0] * R[0]);
+    A(R[0], X[0] - uy[0] * R[0], Y[0] + ux[0] * R[0]);
+  }
+  out.push('Z');
+  return out.join('');
 }
 
+export function buildInkPath(pts) {
+  return new Path2D(outlineSvg(pts, 0, pts.length / 3 - 1, null, true, true));
+}
+
+function lineSvg(P, i0, i1, extra) {
+  const out = [];
+  for (let i = i0; i <= i1; i++) out.push(`${out.length ? 'L' : 'M'}${fx(P[i * 3])} ${fx(P[i * 3 + 1])}`);
+  if (extra) for (const q of extra) out.push(`${out.length ? 'L' : 'M'}${fx(q[0])} ${fx(q[1])}`);
+  if (out.length === 1) out.push(`L${fx((i0 <= i1 ? P[i0 * 3] : extra[0][0]) + 0.01)} ${fx(i0 <= i1 ? P[i0 * 3 + 1] : extra[0][1])}`);
+  return out.join('');
+}
 export function buildLinePath(pts) {
   const n = pts.length / 3;
   if (!n) return new Path2D();
-  const out = [`M${fx(pts[0])} ${fx(pts[1])}`];
-  if (n === 1) out.push(`L${fx(pts[0] + 0.01)} ${fx(pts[1])}`);
-  for (let i = 1; i < n; i++) out.push(`L${fx(pts[i * 3])} ${fx(pts[i * 3 + 1])}`);
-  return new Path2D(out.join(''));
+  return new Path2D(lineSvg(pts, 0, n - 1, null));
 }
 
 // ---------- 拡大しても角が出ない滑らかな線 ----------
@@ -290,6 +300,13 @@ export function simplify(pts, tol) {
 }
 
 // 書いている最中のストローク
+//  - 筆圧は時間で平滑化（Apple Pencil の細かな揺れで太さがブツブツ変わらないように）
+//  - 太さの変化は「進んだ距離あたり」で制限（急に膨らんだ所が玉のように見えるのを防ぐ）
+//  - 位置は中点を通る二次ベジェで平滑化
+//  - 長い線は前半（frozenN 点まで）を別のキャンバスに 1 本の輪郭として描いておき、毎回描き直す量を一定に保つ
+const P_TAU = 26; // 筆圧の平滑化の時定数（ms）
+const P_TAU0 = 8; // 書き始め（ペン先が付いた直後）は素早く追従
+const R_SLOPE = 0.3; // 太さの変化の上限（半径の変化 / 進んだ距離）
 export class LiveStroke {
   constructor({ kind, w, sens = 1, z = 1 }) {
     this.kind = kind;
@@ -298,40 +315,32 @@ export class LiveStroke {
     this.z = z;
     this.raw = []; // x, y, p, t
     this.dense = []; // x, y, r（平滑化済み）
-    this.ink = kind === 'hl' ? null : new InkPath();
-    this.line = kind === 'hl' ? new Path2D() : null;
     this.tol = 0.05 / z;
     this.minStep = 0.22 / z;
     this.ps = -1;
+    this.pt = 0;
+    this.t0 = 0;
     this.len = 0;
     this.bb = [Infinity, Infinity, -Infinity, -Infinity];
-    // 長い線は一定点数ごとに「凍結」して、毎フレーム描き直す量を一定に保つ
-    this.chunks = [];
-    this.frozen = [];
-    this.chunkN = 0;
-    this.cbb = [Infinity, Infinity, -Infinity, -Infinity];
+    this.frozenN = 0; // dense のうち、凍結済み（別キャンバスに描いた）点の数
   }
-  get current() {
-    return this.ink ? this.ink.path : this.line;
-  }
-  takeFrozen() {
-    const f = this.frozen;
-    this.frozen = [];
-    return f;
-  }
-  fullPath() {
-    if (!this.chunks.length) return this.current;
-    const P = new Path2D();
-    for (const c of this.chunks) P.addPath(c);
-    P.addPath(this.current);
-    return P;
+  get count() {
+    return this.dense.length / 3;
   }
   rad(p) {
     return this.kind === 'hl' ? this.w / 2 : radiusFor(this.w, p, this.sens);
   }
   add(x, y, p, t) {
     const raw = this.raw;
-    this.ps = this.ps < 0 ? p : this.ps + (p - this.ps) * 0.5;
+    if (this.ps < 0) {
+      this.ps = p;
+      this.t0 = this.pt = t;
+    } else {
+      const dt = Math.max(0, Math.min(50, t - this.pt));
+      this.pt = t;
+      const tau = t - this.t0 < 40 ? P_TAU0 : P_TAU;
+      this.ps += (p - this.ps) * (1 - Math.exp(-dt / tau));
+    }
     const ps = this.ps;
     const L = raw.length;
     if (L) {
@@ -371,55 +380,64 @@ export class LiveStroke {
       this.emit(a * ax + b * cx + c * bx, a * ay + b * cy + c * by, this.rad(a * ap + b * cp + c * bp), false);
     }
   }
+  // 直前の点から距離 ds 進む間に変えてよい太さの範囲に収める
+  limitR(r, x, y) {
+    const d = this.dense, n = d.length;
+    if (!n) return r;
+    const lim = R_SLOPE * Math.hypot(x - d[n - 3], y - d[n - 2]) + 1e-4;
+    const pr = d[n - 1];
+    return r > pr + lim ? pr + lim : r < pr - lim ? pr - lim : r;
+  }
   emit(x, y, r, force) {
     const d = this.dense, n = d.length;
     if (n && !force) {
       if (Math.abs(x - d[n - 3]) + Math.abs(y - d[n - 2]) < this.minStep && Math.abs(r - d[n - 1]) < 0.04) return;
     }
-    d.push(x, y, r);
-    if (this.ink) this.ink.push(x, y, r);
-    else if (n === 0) this.line.moveTo(x, y);
-    else this.line.lineTo(x, y);
-    const pad = this.kind === 'hl' ? this.w / 2 + 1 : r + 1;
-    const b = this.cbb;
-    if (x - pad < b[0]) b[0] = x - pad;
-    if (y - pad < b[1]) b[1] = y - pad;
-    if (x + pad > b[2]) b[2] = x + pad;
-    if (y + pad > b[3]) b[3] = y + pad;
-    if (++this.chunkN >= 120) {
-      const done = this.current;
-      this.chunks.push(done);
-      this.frozen.push(done);
-      if (this.ink) {
-        this.ink = new InkPath();
-        this.ink.push(x, y, r);
-      } else {
-        this.line = new Path2D();
-        this.line.moveTo(x, y);
-      }
-      this.chunkN = 1;
-      this.cbb = [x - pad, y - pad, x + pad, y + pad];
-    }
+    d.push(x, y, this.kind === 'hl' ? r : this.limitR(r, x, y));
   }
-  // 未確定の末端＋予測点
-  tip(pred) {
-    const raw = this.raw, L = raw.length;
-    const d = this.dense, n = d.length;
+  // 未確定の末端（最後の入力点）＋予測点
+  tipPts(pred) {
+    const raw = this.raw, L = raw.length, d = this.dense, n = d.length;
     if (!L || !n) return null;
-    const lx = raw[L - 4], ly = raw[L - 3], lr = this.rad(this.ps);
-    if (this.ink) {
-      const b = new InkPath();
-      b.push(d[n - 3], d[n - 2], d[n - 1]);
-      b.push(lx, ly, lr);
-      if (pred) for (const q of pred) b.push(q[0], q[1], lr);
-      b.cap();
-      return b.path;
-    }
-    const P = new Path2D();
-    P.moveTo(d[n - 3], d[n - 2]);
-    P.lineTo(lx + 0.001, ly);
-    if (pred) for (const q of pred) P.lineTo(q[0], q[1]);
-    return P;
+    const lx = raw[L - 4], ly = raw[L - 3];
+    const lr = this.kind === 'hl' ? this.w / 2 : this.limitR(this.rad(this.ps), lx, ly);
+    const out = [[lx, ly, lr]];
+    if (pred) for (const q of pred) out.push([q[0], q[1], lr]);
+    return out;
+  }
+  // 凍結していない部分（つなぎ目は 1 区間だけ重ねる）＋ペン先 のパス
+  chunkPath(pred) {
+    const n = this.count;
+    const from = Math.max(0, this.frozenN - 1);
+    const tip = this.tipPts(pred);
+    if (this.kind === 'hl') return new Path2D(lineSvg(this.dense, from, n - 1, tip));
+    return new Path2D(outlineSvg(this.dense, from, n - 1, tip, from === 0, true));
+  }
+  // 先頭から to 番目までのパス（凍結用。終端は平らに切る）
+  prefixPath(to) {
+    if (this.kind === 'hl') return new Path2D(lineSvg(this.dense, 0, to, null));
+    return new Path2D(outlineSvg(this.dense, 0, to, null, true, false));
+  }
+  fullPath() {
+    const n = this.count;
+    if (this.kind === 'hl') return new Path2D(lineSvg(this.dense, 0, n - 1, null));
+    return new Path2D(outlineSvg(this.dense, 0, n - 1, null, true, true));
+  }
+  // 凍結していない部分の範囲（描き直す範囲）
+  chunkBB(pred) {
+    const d = this.dense, n = this.count;
+    const b = [Infinity, Infinity, -Infinity, -Infinity];
+    const inc = (x, y, r) => {
+      const p = (this.kind === 'hl' ? this.w / 2 : r) + 1;
+      if (x - p < b[0]) b[0] = x - p;
+      if (y - p < b[1]) b[1] = y - p;
+      if (x + p > b[2]) b[2] = x + p;
+      if (y + p > b[3]) b[3] = y + p;
+    };
+    for (let i = Math.max(0, this.frozenN - 1); i < n; i++) inc(d[i * 3], d[i * 3 + 1], d[i * 3 + 2]);
+    const tip = this.tipPts(pred);
+    if (tip) for (const q of tip) inc(q[0], q[1], q[2]);
+    return b;
   }
   lastPoint() {
     const raw = this.raw, L = raw.length;
@@ -429,7 +447,6 @@ export class LiveStroke {
     const raw = this.raw, L = raw.length;
     if (!L) return;
     if (L >> 2 >= 2) this.emit(raw[L - 4], raw[L - 3], this.rad(this.ps), true);
-    if (this.ink) this.ink.cap();
   }
   points() {
     const tol = this.kind === 'hl' ? 0.2 / this.z : Math.min(0.1, 0.06 / this.z);

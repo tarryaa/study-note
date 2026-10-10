@@ -284,7 +284,16 @@ class App {
       reloading = true;
       location.reload();
     });
+    const t0 = performance.now();
+    // 起動直後に新しいバージョンが見つかったら、書き始める前にそのまま更新する（古い版を使い続けないように）
+    const autoApply = async (w) => {
+      if (this.editor.note) await this.editor.save();
+      ui.toast('アプリを更新しています…', { icon: 'sparkle', duration: 4000 });
+      w.postMessage('skipWaiting');
+    };
     const prompt = (w) => {
+      const busy = this.editor.engine && this.editor.engine.action;
+      if (performance.now() - t0 < 12000 && !busy) return autoApply(w);
       ui.toast('新しいバージョンがあります', {
         icon: 'sparkle',
         action: '更新',

@@ -233,6 +233,8 @@ export class Editor {
         this.onView();
       },
       onGesture: (k) => ui.hud(k === 'undo' ? '元に戻す' : 'やり直す', k),
+      // ぐしゃぐしゃで消したときは、すぐ戻せるように「元に戻す」を出す
+      onScribbleErase: (n) => ui.toast(`${n} 本の線を消しました`, { icon: 'sparkle', action: '元に戻す', onAction: () => this.engine.undo(), duration: 3500 }),
       onPenDetected: () => {
         this.updateFinger();
         ui.toast('Apple Pencil を検出しました。指はスクロールとズーム用になります', { icon: 'pen', duration: 4200 });

@@ -28,6 +28,7 @@ const PREVIEW_PX = 1.1e6; // 予備の縮小版 1 枚のピクセル数
 const SEL_PX = 10e6;
 const EDGE = 18; // 拡大時にページの端を寄せる位置（px）
 const HOLD_MS = 420; // 図形補正までの長押し時間
+const LIVE_CHUNK = 160; // 書いている線の、毎回描き直す部分の最大の点数
 const PULL = 120; // 最後のページで横に引っ張ってページを追加するまでの距離
 const now = () => performance.now();
 // 図形補正のうち角のあるもの（線を滑らかに補間しない）
@@ -1102,6 +1103,10 @@ export class Engine {
       if (e.button === 1 || e.button === 2) this.beginMousePan(e);
       return;
     }
+    // ペンが新しく画面に触れた＝前の線は確実に終わっている（ペンを離した通知を取りこぼしても、
+    // 2 本の線が 1 本につながって判定されることがないように、ここで前の線を確定させる）
+    const prev = this.action;
+    if (prev && type === 'pen' && prev.pointerType === 'pen') this.endAction(prev, null, false);
     if (this.action) return;
     this.cancelTouchGesture();
     this.stopAnim();
@@ -1112,7 +1117,15 @@ export class Engine {
     if (!this.loaded) return;
     if (e.pointerType === 'touch') return this.touchMove(e);
     const a = this.action;
-    if (a && a.pointerId === e.pointerId) return this.moveAction(a, e);
+    if (a && a.pointerId === e.pointerId) {
+      // ペンが浮いている（押していない）移動が続いたら、離した通知を取りこぼしたとみなして線を終える
+      if (e.pointerType === 'pen' && e.buttons === 0 && !(e.pressure > 0)) {
+        if (++a.upMoves >= 3) return this.onUp(e, false);
+        return;
+      }
+      a.upMoves = 0;
+      return this.moveAction(a, e);
+    }
     if (this.mousePan && this.mousePan.id === e.pointerId) {
       const m = this.mousePan;
       const b = this.dragBounds(m.v0.z);
@@ -1172,7 +1185,7 @@ export class Engine {
     // ペンを離した直後・ペンが浮いている間に置かれた指は手のひらとみなす
     if (!this.touches.size && !this.fingerDraws()) {
       const tn = now();
-      if (tn - (this.lastPenUp || 0) < 250 || tn - (this.lastPenHover || 0) < 200) return;
+      if (tn - (this.lastPenUp || 0) < 350 || tn - (this.lastPenHover || 0) < 200) return;
       if (e.width > 70 && e.height > 70) return;
     }
     const sp = this.sp(e);
@@ -1317,9 +1330,11 @@ export class Engine {
     if (this.touches.size === 0 && this.tapSess) {
       const s = this.tapSess;
       this.tapSess = null;
+      // 書いた直後に手のひらが触れて離れたのを「2 本指タップ（元に戻す）」と誤認しない
+      const palmy = s.t0 - (this.lastPenUp || 0) < 500;
       if (!cancel && !s.moved && !s.drew && now() - s.t0 < 330) {
         if (s.max === 2 && settings.twoFingerUndo) {
-          if (this.undo()) this.hooks.onGesture && this.hooks.onGesture('undo');
+          if (!palmy && this.undo()) this.hooks.onGesture && this.hooks.onGesture('undo');
         } else if (s.max === 3 && settings.twoFingerUndo) {
           if (this.redo()) this.hooks.onGesture && this.hooks.onGesture('redo');
         } else if (s.max === 1) this.onTap(s.sp);
@@ -1351,7 +1366,7 @@ export class Engine {
   begin(e) {
     const sp = this.sp(e);
     const wp = this.toWorld(sp);
-    const base = { pointerId: e.pointerId, pointerType: e.pointerType, t0: now(), sp0: sp, kind: 'none' };
+    const base = { pointerId: e.pointerId, pointerType: e.pointerType, t0: now(), sp0: sp, kind: 'none', upMoves: 0 };
     if (this.textEdit) {
       this.commitText();
       this.action = base;
@@ -1481,6 +1496,18 @@ export class Engine {
   }
   moveStroke(a, e) {
     const evs = coalesced(e);
+    // ペンを離した通知が届かずに次の線を書き始めた場合（間が空いて、離れた場所から急に続く）は、
+    // 前の線をそこで確定して新しい線として書き始める（2 本の線が 1 本につながらないように）
+    const raw = a.live.raw, RL = raw.length;
+    if (RL && e.pointerType === 'pen' && !a.shape) {
+      const ev0 = evs[0];
+      const [x, y] = this.localPt(ev0, a.pv);
+      if (ev0.timeStamp - raw[RL - 1] > 110 && Math.hypot(x - raw[RL - 4], y - raw[RL - 3]) * this.view.z > 10) {
+        this.endAction(a, null, false);
+        this.begin(e);
+        return;
+      }
+    }
     if (a.shape) {
       const [x, y] = this.localPt(evs[evs.length - 1], a.pv);
       this.adjustShape(a, x, y);
@@ -1526,32 +1553,40 @@ export class Engine {
     const ctx = this.inkCtx, pv = a.pv, live = a.live;
     const [k, ox, oy] = this.inkTransform(pv);
     const hl = a.o.kind === 'hl';
+    const paint = (c, path) => {
+      if (hl) {
+        c.strokeStyle = a.o.color;
+        c.lineWidth = a.o.w;
+        c.lineCap = 'round';
+        c.lineJoin = 'round';
+        c.stroke(path);
+      } else {
+        c.fillStyle = a.o.color;
+        c.fill(path);
+      }
+    };
     if (a.shape) this.clearInk();
     else {
       this.clearTip();
-      // 凍結されたチャンクは別キャンバスへ 1 回だけ描く
-      const frozen = live.takeFrozen();
-      if (frozen.length) {
+      // 長い線は前半を別キャンバスへ。前半全体を 1 本の輪郭として描き直すので継ぎ目が残らない
+      const n = live.count;
+      if (n - live.frozenN > LIVE_CHUNK) {
+        const F = n - 1;
         const f = this.frozenCtx;
+        const d = this.frozenDirty;
+        if (d) {
+          f.setTransform(1, 0, 0, 1, 0, 0);
+          f.clearRect(d[0], d[1], d[2] - d[0], d[3] - d[1]);
+        }
         f.setTransform(k, 0, 0, k, ox, oy);
         f.save();
         f.beginPath();
         f.rect(0, 0, pv.page.w, pv.page.h);
         f.clip();
-        if (hl) {
-          f.strokeStyle = a.o.color;
-          f.lineWidth = a.o.w;
-          f.lineCap = 'round';
-          f.lineJoin = 'round';
-          for (const p of frozen) f.stroke(p);
-        } else {
-          f.fillStyle = a.o.color;
-          for (const p of frozen) f.fill(p);
-        }
+        paint(f, live.prefixPath(F));
         f.restore();
-        const r = this.devRect(pv, live.bb, a.o.w + 3);
-        const d = this.frozenDirty;
-        this.frozenDirty = d ? [Math.min(d[0], r[0]), Math.min(d[1], r[1]), Math.max(d[2], r[2]), Math.max(d[3], r[3])] : r;
+        this.frozenDirty = this.devRect(pv, live.bb, a.o.w + 3);
+        live.frozenN = F;
       }
     }
     ctx.setTransform(k, 0, 0, k, ox, oy);
@@ -1565,44 +1600,12 @@ export class Engine {
       // 確定後と同じパス（同じ補間）で描く
       const path = strokePath(pts, hl, k, SHARP_KINDS.has(a.shape.kind));
       a.shape.path = path;
-      if (hl) {
-        ctx.strokeStyle = a.o.color;
-        ctx.lineWidth = a.o.w;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.stroke(path);
-      } else {
-        ctx.fillStyle = a.o.color;
-        ctx.fill(path);
-      }
+      paint(ctx, path);
       bb = computeBB(pts);
     } else {
-      const tip = live.tip(pred);
-      // 本体とペン先を 1 つのパスにして 1 回で塗る（重なった縁が濃くならない＝確定後と同じ見た目）
-      let path = hl ? live.line : live.ink.path;
-      if (tip) {
-        path = new Path2D(path);
-        path.addPath(tip);
-      }
-      if (hl) {
-        ctx.strokeStyle = a.o.color;
-        ctx.lineWidth = a.o.w;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.stroke(path);
-      } else {
-        ctx.fillStyle = a.o.color;
-        ctx.fill(path);
-      }
-      // 描き直す範囲は「今のチャンク＋ペン先」だけ
-      bb = live.cbb.slice();
-      const lp = live.lastPoint();
-      for (const q of lp ? [lp].concat(pred || []) : pred || []) {
-        if (q[0] < bb[0]) bb[0] = q[0];
-        if (q[1] < bb[1]) bb[1] = q[1];
-        if (q[0] > bb[2]) bb[2] = q[0];
-        if (q[1] > bb[3]) bb[3] = q[1];
-      }
+      // まだ凍結していない部分とペン先を 1 本の輪郭にして 1 回で塗る（確定後と同じ形・同じ見た目）
+      paint(ctx, live.chunkPath(pred));
+      bb = live.chunkBB(pred);
     }
     ctx.restore();
     this.inkDirty = this.devRect(pv, bb, a.o.w + 3);
@@ -1786,7 +1789,7 @@ export class Engine {
     // 書いている時に表示していたパスをそのまま使う → ペンを離しても見た目が変わらない
     const k = this.view.z * this.dpr;
     if (a.shape) setItemPath(it, a.shape.path, k);
-    else if (a.live.dense.length > 3) setItemPath(it, a.live.fullPath(), k);
+    else if (a.live.count > 1) setItemPath(it, a.live.fullPath(), k);
     this.beginEdit(pv);
     pv.page.items.push(it);
     this.commitEdits();

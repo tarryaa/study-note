@@ -3,7 +3,9 @@
 //
 // 「あ」「ぬ」「め」のような交差やループのある普通の字では反応しないように:
 //  - 手ぶれ・細かいカーブを拾わないよう、線の大きさに応じた許容誤差で折れ線に単純化してから調べる
-//  - ジグザグ：ほぼ真逆に折り返す（約 140° 以上）往復だけを数える。ゆるい曲がり・ループは数えない
+//  - 判定は「今書いている 1 本の線」だけで行う（ほかの線との重なりは判定に使わない）
+//  - ジグザグ：ほぼ真逆に折り返す（約 140° 以上）往復が、途切れずに何回も続いたときだけ。
+//    字の中にたまたまある 1〜2 回の折り返し・ゆるい曲がり・ループは数えない
 //  - ぐるぐる：同じ向きに何周も回っていて、しかも同じ場所に重なっている（線の長さ ≫ 大きさ）場合だけ
 //  - 回転量は「向きつき」で合計するので、手ぶれの左右の揺れは打ち消し合って溜まらない
 const PARAMS = [
@@ -51,7 +53,15 @@ function simplifyIdx(raw, n, tol) {
 }
 
 export function detectScribble(raw, z, sens = 1) {
-  const n = raw.length >> 2;
+  // 途中で間が空いた所（ペンが離れていた所）があれば、そこから後ろだけを 1 本の線として調べる
+  let n = raw.length >> 2;
+  for (let i = n - 1; i > 0; i--) {
+    if (raw[i * 4 + 3] - raw[i * 4 - 1] > 110) {
+      raw = raw.slice(i * 4);
+      n = raw.length >> 2;
+      break;
+    }
+  }
   if (n < 8) return false;
   const P = PARAMS[sens] || PARAMS[1];
   // 長さ・範囲・速さ
@@ -78,19 +88,36 @@ export function detectScribble(raw, z, sens = 1) {
   const m = V.length;
   if (m < 3) return false;
   const minSeg = Math.max(7 / z, diag * 0.08);
-  let rev = 0, turn = 0;
-  for (let k = 1; k < m - 1; k++) {
-    const a = V[k - 1] * 4, b = V[k] * 4, c = V[k + 1] * 4;
-    const ux = raw[b] - raw[a], uy = raw[b + 1] - raw[a + 1];
-    const vx = raw[c] - raw[b], vy = raw[c + 1] - raw[b + 1];
-    const lu = Math.hypot(ux, uy), lv = Math.hypot(vx, vy);
-    if (lu < 1e-9 || lv < 1e-9) continue;
-    const cos = (ux * vx + uy * vy) / (lu * lv);
-    turn += Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);
-    // ほぼ真逆への折り返しで、前後の区間がどちらも十分長いものだけ
-    if (cos < P.cos && lu >= minSeg && lv >= minSeg) rev++;
+  // 十分長い区間だけを取り出す（折り返し部分の丸みで出来る短い区間は飛ばす）
+  const segs = [];
+  let turn = 0;
+  for (let k = 1; k < m; k++) {
+    const a = V[k - 1] * 4, b = V[k] * 4;
+    const dx = raw[b] - raw[a], dy = raw[b + 1] - raw[a + 1];
+    const L = Math.hypot(dx, dy);
+    if (L < 1e-9) continue;
+    if (segs.length) {
+      const p = segs[segs.length - 1];
+      turn += Math.atan2(p.dx * dy - p.dy * dx, p.dx * dx + p.dy * dy);
+    }
+    segs.push({ dx, dy, L, dt: raw[b + 3] - raw[a + 3] });
   }
-  if (rev >= P.rev && ratio >= P.ratio) return true;
+  const long = segs.filter((g) => g.L >= minSeg);
+  // ジグザグ：長い区間どうしが「ほぼ真逆・同じくらいの長さ・素早い」往復を、途切れずに何回続けたか
+  // （字の中にたまたま 1〜2 回ある折り返しは、続けて数えないので反応しない）
+  let run = 0, best = 0;
+  for (let j = 1; j < long.length; j++) {
+    const p = long[j - 1], q = long[j];
+    const cos = (p.dx * q.dx + p.dy * q.dy) / (p.L * q.L);
+    const similar = Math.min(p.L, q.L) / Math.max(p.L, q.L) >= 0.3;
+    const quick = q.dt <= 450 && p.dt <= 450;
+    if (cos < P.cos && similar && quick) {
+      run++;
+      if (run > best) best = run;
+    } else run = 0;
+  }
+  if (best >= P.rev && ratio >= P.ratio) return true;
+  // ぐるぐる：同じ向きに何周も、同じ場所で回っている
   const loops = Math.abs(turn) / (Math.PI * 2);
   return loops >= P.loops && ratio >= P.loopRatio;
 }
