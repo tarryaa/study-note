@@ -1579,7 +1579,10 @@ export class Engine {
       cancelAnimationFrame(a.antsRaf);
       this.clearFx();
     } else if (a.kind === 'sel') this.endSel();
-    else if (a.kind === 'shapeTool' || a.kind === 'stamp') this.clearInk();
+    else if (a.kind === 'shapeTool' || a.kind === 'stamp') {
+      this.clearInk();
+      this.clearFx();
+    }
   }
 
   // ---------------------------------------------------------------- ペン・蛍光ペン
@@ -1671,6 +1674,7 @@ export class Engine {
       const [x, y] = this.localPt(evs[evs.length - 1], a.pv);
       this.adjustShape(a, x, y);
       this.drawLive(a, null);
+      this.drawSnapMark(a);
       return;
     }
     this.feed(a, evs, e);
@@ -1779,14 +1783,189 @@ export class Engine {
   updateHold(a, sp) {
     if (Math.hypot(sp.x - a.anchor.x, sp.y - a.anchor.y) > 6) this.armHold(a, sp);
   }
+  // ---- 吸着：図形の角・端点・円の中心（点）と、図形の辺・円周（線）に吸い付く
+  // 対象は図形として描いたもの（長押しで整えた図形・図形ツール）だけ。手書きの文字などには吸い付かない
+  buildSnap(pv) {
+    const pts = [], segs = [];
+    for (const it of pv.page.items) {
+      if (it.t !== 's' || !(it.sk || it.sh)) continue;
+      const p = it.pts, n = p.length / 3;
+      if (n < 2) continue;
+      const kind = it.sk || 'poly';
+      const closed = n > 2 && Math.hypot(p[0] - p[(n - 1) * 3], p[1] - p[(n - 1) * 3 + 1]) < 1e-3;
+      if (kind === 'ellipse') {
+        if (closed) pts.push([(it.bb[0] + it.bb[2]) / 2, (it.bb[1] + it.bb[3]) / 2]);
+      } else if (kind === 'arc' || kind === 'curve') {
+        pts.push([p[0], p[1]], [p[(n - 1) * 3], p[(n - 1) * 3 + 1]]);
+      } else {
+        const m = closed ? n - 1 : n;
+        for (let i = 0; i < m; i++) {
+          let corner = !closed && (i === 0 || i === n - 1);
+          if (!corner) {
+            const a = closed ? (i - 1 + m) % m : i - 1, b = closed ? (i + 1) % m : i + 1;
+            const ux = p[i * 3] - p[a * 3], uy = p[i * 3 + 1] - p[a * 3 + 1], vx = p[b * 3] - p[i * 3], vy = p[b * 3 + 1] - p[i * 3 + 1];
+            const lu = Math.hypot(ux, uy), lv = Math.hypot(vx, vy);
+            corner = lu > 1e-6 && lv > 1e-6 && (ux * vx + uy * vy) / (lu * lv) < 0.92;
+          }
+          if (corner) pts.push([p[i * 3], p[i * 3 + 1]]);
+        }
+      }
+      for (let i = 0; i < n - 1; i++) segs.push([p[i * 3], p[i * 3 + 1], p[i * 3 + 3], p[i * 3 + 4]]);
+    }
+    return { pts, segs };
+  }
+  // (x, y) の近くの吸着先。角・端点・中心が最優先、なければ線の上の最も近い点
+  snapAt(S, x, y, onlyPoints) {
+    if (!S) return null;
+    const z = this.view.z;
+    let best = null, bd = 16 / z;
+    for (const q of S.pts) {
+      const d = Math.hypot(q[0] - x, q[1] - y);
+      if (d < bd) {
+        bd = d;
+        best = q;
+      }
+    }
+    if (best) return { x: best[0], y: best[1], kind: 'point' };
+    if (onlyPoints) return null;
+    bd = 10 / z;
+    for (const [ax, ay, bx, by] of S.segs) {
+      const dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy;
+      let t = L2 > 0 ? ((x - ax) * dx + (y - ay) * dy) / L2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const fx = ax + dx * t, fy = ay + dy * t;
+      const d = Math.hypot(fx - x, fy - y);
+      if (d < bd) {
+        bd = d;
+        best = [fx, fy];
+      }
+    }
+    return best ? { x: best[0], y: best[1], kind: 'line' } : null;
+  }
+  // 長押しで整えた直後の図形を、近くの角・線に合わせる。書き終わり側の端の吸着先（弧・曲線用）を返す
+  snapRecognized(a, res) {
+    const S = a.snap, P = res.pts, n = P.length / 3;
+    const hits = [];
+    const move = (dx, dy) => {
+      for (let i = 0; i < n; i++) {
+        P[i * 3] += dx;
+        P[i * 3 + 1] += dy;
+      }
+      if (res.center) res.center = [res.center[0] + dx, res.center[1] + dy];
+    };
+    let endHit = null;
+    switch (res.kind) {
+      case 'line':
+      case 'polyline': {
+        for (const i of [0, n - 1]) {
+          const h = this.snapAt(S, P[i * 3], P[i * 3 + 1]);
+          if (h) {
+            P[i * 3] = h.x;
+            P[i * 3 + 1] = h.y;
+            if (i === 0) hits.push(h);
+            else endHit = h;
+          }
+        }
+        break;
+      }
+      case 'arc':
+      case 'curve': {
+        const h = this.snapAt(S, P[0], P[1]);
+        if (h) {
+          move(h.x - P[0], h.y - P[1]);
+          hits.push(h);
+        }
+        endHit = this.snapAt(S, P[(n - 1) * 3], P[(n - 1) * 3 + 1]);
+        break;
+      }
+      case 'rect': {
+        // 四角形は形を保ったまま、いちばん近い角が吸い付くように全体をずらす
+        let best = null;
+        for (let i = 0; i < n - 1; i++) {
+          const h = this.snapAt(S, P[i * 3], P[i * 3 + 1], true);
+          const d = h ? Math.hypot(h.x - P[i * 3], h.y - P[i * 3 + 1]) : Infinity;
+          if (h && (!best || d < best.d)) best = { h, d, i };
+        }
+        if (best) {
+          move(best.h.x - P[best.i * 3], best.h.y - P[best.i * 3 + 1]);
+          hits.push(best.h);
+        }
+        break;
+      }
+      case 'ellipse': {
+        if (res.center) {
+          const h = this.snapAt(S, res.center[0], res.center[1], true);
+          if (h) {
+            move(h.x - res.center[0], h.y - res.center[1]);
+            hits.push(h);
+          }
+        }
+        break;
+      }
+      default: {
+        // 三角形・多角形は角ごとに吸い付く
+        for (let i = 0; i < n - 1; i++) {
+          const h = this.snapAt(S, P[i * 3], P[i * 3 + 1]);
+          if (h) {
+            P[i * 3] = h.x;
+            P[i * 3 + 1] = h.y;
+            hits.push(h);
+          }
+        }
+        P[(n - 1) * 3] = P[0];
+        P[(n - 1) * 3 + 1] = P[1];
+        if (hits.length && res.center) {
+          let cx = 0, cy = 0;
+          for (let i = 0; i < n - 1; i++) {
+            cx += P[i * 3] / (n - 1);
+            cy += P[i * 3 + 1] / (n - 1);
+          }
+          res.center = [cx, cy];
+        }
+      }
+    }
+    // 動かない部分の吸着（始点・図形全体）と、ペンで動かしている端の吸着を分けて覚えておく
+    a.snapFixed = hits;
+    a.snapHit = endHit ? [endHit] : null;
+    return endHit;
+  }
+  // 吸い付いた所に小さな丸印
+  drawSnapMark(a) {
+    this.clearFx();
+    const hits = (a.snapFixed || []).concat(a.snapHit || []);
+    if (!hits.length) return;
+    const pv = a.pv, ctx = this.fxCtx;
+    const [k, ox, oy] = this.inkTransform(pv);
+    const z = this.view.z;
+    ctx.setTransform(k, 0, 0, k, ox, oy);
+    ctx.save();
+    ctx.strokeStyle = this.accent;
+    ctx.fillStyle = this.accent;
+    ctx.lineWidth = 2 / z;
+    for (const h of hits) {
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(h.x, h.y, 7 / z, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 0.25;
+      ctx.fill();
+      this.markFx(pv, [h.x, h.y, h.x, h.y], 10 / z);
+    }
+    ctx.restore();
+  }
   onHold(a) {
     if (this.action !== a || a.scribble || a.shape) return;
     if (a.live.len * this.view.z < 20) return;
     const res = recognizeShape(a.live.allPoints(), this.view.z);
     if (!res) return;
     const lp = a.live.lastPoint();
+    a.snap = this.buildSnap(a.pv);
+    const endHit = this.snapRecognized(a, res);
     a.shape = { ...res, base: Float32Array.from(res.pts), hold: lp ? [lp[0], lp[1]] : null, th: 0 };
+    // 書き終わり側の端が吸い付く先があれば、そこへ（弧・曲線は形を保ったまま回転・伸縮で合わせる）
+    if (endHit && (res.kind === 'arc' || res.kind === 'curve')) this.adjustShape(a, endHit.x, endHit.y);
     this.drawLive(a, null);
+    this.drawSnapMark(a);
     this.pulseAt(a.anchor);
     this.hooks.onShape && this.hooks.onShape(res.kind);
   }
@@ -1794,9 +1973,20 @@ export class Engine {
   adjustShape(a, x, y) {
     const sh = a.shape, B = sh.base, P = sh.pts;
     const n = B.length / 3;
+    // 動かしている端は、近くの図形の角・端点・線に吸い付く
+    a.snapHit = null;
+    if (sh.kind === 'line' || sh.kind === 'polyline' || sh.kind === 'arc' || sh.kind === 'curve') {
+      if (!a.snap) a.snap = this.buildSnap(a.pv);
+      const hit = this.snapAt(a.snap, x, y);
+      if (hit) {
+        x = hit.x;
+        y = hit.y;
+        a.snapHit = [hit];
+      }
+    }
     switch (sh.kind) {
       case 'line': {
-        const e = snapLineEnd(B[0], B[1], x, y);
+        const e = a.snapHit ? [x, y] : snapLineEnd(B[0], B[1], x, y);
         P[3] = e[0];
         P[4] = e[1];
         break;
@@ -1804,7 +1994,7 @@ export class Engine {
       case 'polyline': {
         // 最後の辺だけが、ひとつ前の角を中心に 360° 回る
         const px = B[(n - 2) * 3], py = B[(n - 2) * 3 + 1];
-        const e = snapLineEnd(px, py, x, y);
+        const e = a.snapHit ? [x, y] : snapLineEnd(px, py, x, y);
         P[(n - 1) * 3] = e[0];
         P[(n - 1) * 3 + 1] = e[1];
         break;
@@ -1964,6 +2154,7 @@ export class Engine {
     const it = { id: uid(), t: 's', k: o.kind, c: o.color, w: o.w, pts: Float32Array.from(pts) };
     if (o.kind === 'hl') it.a = o.alpha;
     if (a.shape && SHARP_KINDS.has(a.shape.kind)) it.sh = 1; // 角のある図形は補間しない
+    if (a.shape) it.sk = a.shape.kind; // 図形の種類（ほかの図形を描くときの吸着先になる）
     it.bb = computeBB(it.pts);
     // 書いている時に表示していたパスをそのまま使う → ペンを離しても見た目が変わらない
     const k = this.view.z * this.dpr;
@@ -1995,16 +2186,23 @@ export class Engine {
   }
   beginShapeTool(base, pv, e) {
     const o = this.shapeOpts();
-    const [x, y] = this.localPt(e, pv);
-    this.action = { ...base, kind: 'shapeTool', pv, o, x0: x, y0: y, pts: null, closed: false };
+    let [x, y] = this.localPt(e, pv);
+    const snap = this.buildSnap(pv);
+    const h0 = this.snapAt(snap, x, y);
+    if (h0) [x, y] = [h0.x, h0.y];
+    this.action = { ...base, kind: 'shapeTool', pv, o, x0: x, y0: y, pts: null, closed: false, snap, h0 };
     this.resetInkStyle();
     this.hideCursor();
     this.drawShapeTool(this.action, x, y);
   }
   moveShapeTool(a, e) {
     const evs = coalesced(e);
-    const [x, y] = this.localPt(evs[evs.length - 1], a.pv);
+    let [x, y] = this.localPt(evs[evs.length - 1], a.pv);
+    const h = this.snapAt(a.snap, x, y);
+    if (h) [x, y] = [h.x, h.y];
+    a.snapHit = [a.h0, h].filter(Boolean);
     this.drawShapeTool(a, x, y);
+    this.drawSnapMark(a);
   }
   drawShapeTool(a, x, y) {
     const g = shapeGeometry(a.o.kind, a.x0, a.y0, x, y, { w: a.o.w, square: a.o.square });
@@ -2040,6 +2238,7 @@ export class Engine {
   endShapeTool(a, cancel) {
     const pts = a.pts;
     this.clearInk();
+    this.clearFx();
     if (cancel || !pts) return;
     const bb = computeBB(pts);
     const z = this.view.z;
@@ -2047,6 +2246,7 @@ export class Engine {
     const pv = a.pv;
     const it = { id: uid(), t: 's', k: 'pen', c: a.o.color, w: a.o.w, pts, bb };
     if (a.o.kind !== 'ellipse') it.sh = 1;
+    it.sk = a.o.kind;
     if (a.path) setItemPath(it, a.path, z * this.dpr);
     if (a.closed && a.o.fill !== 'none') {
       it.f = a.o.color;
@@ -2167,7 +2367,7 @@ export class Engine {
         const frags = splitStroke(it, x, y, R);
         if (frags === null) continue;
         this.beginEdit(pv);
-        items.splice(i, 1, ...frags.map((f) => ({ ...it, id: uid(), pts: f, bb: computeBB(f), f: undefined, fa: undefined })));
+        items.splice(i, 1, ...frags.map((f) => ({ ...it, id: uid(), pts: f, bb: computeBB(f), f: undefined, fa: undefined, sk: undefined })));
       }
       const d = a.dirty.get(pv);
       const b = it.bb;
