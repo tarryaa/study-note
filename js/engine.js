@@ -334,6 +334,19 @@ export class Engine {
     const lv = clamp(+settings.pinchLevel || 5, 1, 10);
     return Math.pow(1.3, lv - 5);
   }
+  // 移動の感度：5 で指の動きそのまま。1 段ごとに約 1.15 倍
+  panGain() {
+    return Math.pow(1.15, clamp(+settings.panLevel || 5, 1, 10) - 5);
+  }
+  // 指を離したあとの滑り：数字が大きいほど勢いが強く、長く滑る（5 = 標準）
+  glide() {
+    const lv = clamp(+settings.glideLevel || 5, 1, 10);
+    return { v: Math.pow(1.08, lv - 5), rate: 0.002 * Math.pow(1.3, 5 - lv) };
+  }
+  // ページのめくりやすさ：数字が大きいほど軽い（5 = 標準）。しきい値に掛ける倍率を返す
+  flipHeavy() {
+    return Math.pow(1.18, 5 - clamp(+settings.pageLevel || 5, 1, 10));
+  }
   // 移動できる範囲（from = 操作を始めたときのページ）
   //  - 拡大してページが画面より広いとき：今のページの中だけ。端から先は引っ張ると重くなり、勢いでは隣へ行かない
   //  - ページ全体が見えているとき：横は最初〜最後のページ（左右にめくれる）
@@ -583,12 +596,16 @@ export class Engine {
   startInertia(vx, vy, from) {
     this.stopAnim();
     this.animZoom = false;
+    const gl = this.glide();
+    const gain = this.panGain() * gl.v;
+    vx *= gain;
+    vy *= gain;
     let last = now();
     const step = () => {
       const tn = now();
       const dt = Math.min(34, tn - last);
       last = tn;
-      const decay = Math.pow(0.998, dt);
+      const decay = Math.pow(1 - gl.rate, dt);
       vx *= decay;
       vy *= decay;
       let { tx, ty, z } = this.view;
@@ -1188,7 +1205,8 @@ export class Engine {
     if (this.mousePan && this.mousePan.id === e.pointerId) {
       const m = this.mousePan;
       const b = this.dragBounds(m.v0.z, m.from);
-      this.setView(rubber(m.v0.tx + e.clientX - m.x, b.minTx, b.maxTx, this.sw), rubber(m.v0.ty + e.clientY - m.y, b.minTy, b.maxTy, this.sh), m.v0.z);
+      const gain = this.panGain();
+      this.setView(rubber(m.v0.tx + (e.clientX - m.x) * gain, b.minTx, b.maxTx, this.sw), rubber(m.v0.ty + (e.clientY - m.y) * gain, b.minTy, b.maxTy, this.sh), m.v0.z);
       return;
     }
     if (!a) this.hover(e);
@@ -1228,7 +1246,8 @@ export class Engine {
       const k = e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? this.sh : 1;
       const dx = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX, dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
       const b = this.dragBounds(z, this._wheelFrom);
-      this.setView(clamp(tx - dx * k, b.minTx - 40, b.maxTx + 40), clamp(ty - dy * k, b.minTy - 40, b.maxTy + 40), z);
+      const gain = this.panGain();
+      this.setView(clamp(tx - dx * k * gain, b.minTx - 40, b.maxTx + 40), clamp(ty - dy * k * gain, b.minTy - 40, b.maxTy + 40), z);
     }
     clearTimeout(this._wheelT);
     this._wheelT = setTimeout(() => {
@@ -1348,7 +1367,8 @@ export class Engine {
     if (g.mode === 'pan') {
       if (t.id !== g.id) return;
       const b = this.dragBounds(g.v0.z, g.from);
-      const ddx = g.axis === 'y' ? 0 : t.x - g.p0.x, ddy = g.axis === 'x' ? 0 : t.y - g.p0.y;
+      const gain = this.panGain();
+      const ddx = g.axis === 'y' ? 0 : (t.x - g.p0.x) * gain, ddy = g.axis === 'x' ? 0 : (t.y - g.p0.y) * gain;
       const rawTx = g.v0.tx + ddx;
       g.rawTx = rawTx;
       g.dx = ddx;
@@ -1409,10 +1429,12 @@ export class Engine {
             // ページ全体が見えているとき：速く・はっきり横に・ある程度の距離を払ったときだけページをめくる。
             // ゆっくり動かして離したときは、ページの 6 割以上ずらしたときだけ隣へ
             const dx = g.dx || 0;
+            const hv = this.flipHeavy();
             const frac = Math.abs(dx) / ((pv.page.w + GAP) * this.view.z);
-            if (Math.abs(vx) > 0.75 && Math.abs(vx) > Math.abs(vy) * 1.8 && Math.abs(dx) > 80) this.settleView({ vx, from: fi });
+            const fracNeed = clamp(0.6 * Math.sqrt(hv), 0.4, 0.85);
+            if (Math.abs(vx) > 0.75 * hv && Math.abs(vx) > Math.abs(vy) * 1.8 && Math.abs(dx) > 80 * hv) this.settleView({ vx, from: fi });
             else if (Math.abs(vy) > 0.12) this.startInertia(0, vy, fi);
-            else this.settleView({ page: frac > 0.6 && this.pvs[fi + (dx < 0 ? 1 : -1)] ? fi + (dx < 0 ? 1 : -1) : fi });
+            else this.settleView({ page: frac > fracNeed && this.pvs[fi + (dx < 0 ? 1 : -1)] ? fi + (dx < 0 ? 1 : -1) : fi });
           } else if (pv) {
             // 拡大中：ページの端からさらに大きく（画面の幅の 55% 以上）引っ張って離したときだけ隣のページへ。
             // 勢い（慣性）は今のページの端で止まる
@@ -1420,7 +1442,7 @@ export class Engine {
             const raw = g.rawTx != null ? g.rawTx : this.view.tx;
             const over = raw > b.maxTx ? raw - b.maxTx : raw < b.minTx ? raw - b.minTx : 0;
             const to = over > 0 ? fi - 1 : fi + 1;
-            if (Math.abs(over) > A.w * 0.55 && this.pvs[to]) this.settleView({ page: to });
+            if (Math.abs(over) > A.w * Math.min(1.1, 0.55 * this.flipHeavy()) && this.pvs[to]) this.settleView({ page: to });
             else if (Math.hypot(vx, vy) > 0.12) this.startInertia(vx, vy, fi);
             else this.settleView({ page: fi });
           } else this.settleView({ from });

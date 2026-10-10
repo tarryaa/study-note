@@ -75,34 +75,6 @@ function angleAt(p, c, q) {
   return Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb))));
 }
 
-function cornersClosed(R, size) {
-  const tol = size * 0.09;
-  const pts = R.slice();
-  if (pts.length > 3 && dist(pts[0], pts[pts.length - 1]) < size * 0.2) pts.pop();
-  let fi = 0, fd = 0;
-  for (let i = 0; i < pts.length; i++) {
-    const d = dist(pts[0], pts[i]);
-    if (d > fd) { fd = d; fi = i; }
-  }
-  if (fi === 0) return [];
-  const a = dpOpen(pts.slice(0, fi + 1), tol);
-  const b = dpOpen(pts.slice(fi).concat([pts[0]]), tol);
-  const V = a.concat(b.slice(1, -1));
-  let changed = true;
-  while (changed && V.length > 3) {
-    changed = false;
-    for (let i = 0; i < V.length; i++) {
-      const p = V[(i - 1 + V.length) % V.length], c = V[i], q = V[(i + 1) % V.length];
-      if (angleAt(p, c, q) > Math.PI * 0.8 || dist(p, c) < size * 0.12) {
-        V.splice(i, 1);
-        changed = true;
-        break;
-      }
-    }
-  }
-  return V;
-}
-
 function polyErr(R, V, closed) {
   let s = 0;
   const m = V.length;
@@ -205,8 +177,9 @@ function snapAng(a, step, tol) {
 
 function ellipsePts(e) {
   let { a, b, th } = e;
-  if (Math.abs(a - b) / Math.max(a, b) < 0.12) {
-    a = b = (a + b) / 2;
+  if (Math.abs(a - b) / Math.max(a, b) < 0.22) {
+    // 縦横の差が 2 割強くらいまでなら正円にする
+    a = b = e.r || (a + b) / 2;
     th = 0;
   } else th = snapAng(th, Math.PI / 2, 0.14);
   const N = 72;
@@ -223,7 +196,7 @@ function ellipsePts(e) {
 function rectify(V) {
   for (let i = 0; i < 4; i++) {
     const ang = angleAt(V[(i + 3) % 4], V[i], V[(i + 1) % 4]);
-    if (Math.abs(ang - Math.PI / 2) > 0.38) return V;
+    if (Math.abs(ang - Math.PI / 2) > 0.45) return V;
   }
   let sx = 0, sy = 0;
   for (let i = 0; i < 4; i++) {
@@ -265,6 +238,143 @@ function catmull(V, z) {
     }
   }
   return out;
+}
+
+// ---- 曲線を整える：1 本の 3 次ベジェ曲線で近似（両端は固定）
+function bezierFit(P) {
+  const n = P.length;
+  if (n < 4) return null;
+  const P0 = P[0], P3 = P[n - 1];
+  const t = [0];
+  let L = 0;
+  for (let i = 1; i < n; i++) t.push((L += dist(P[i - 1], P[i])));
+  if (L <= 0) return null;
+  for (let i = 0; i < n; i++) t[i] /= L;
+  const at = (C1, C2, u) => {
+    const mu = 1 - u, a = mu * mu * mu, b = 3 * mu * mu * u, c = 3 * mu * u * u, d = u * u * u;
+    return [a * P0[0] + b * C1[0] + c * C2[0] + d * P3[0], a * P0[1] + b * C1[1] + c * C2[1] + d * P3[1]];
+  };
+  let C1 = null, C2 = null;
+  for (let iter = 0; iter < 5; iter++) {
+    let a11 = 0, a12 = 0, a22 = 0, bx1 = 0, by1 = 0, bx2 = 0, by2 = 0;
+    for (let i = 0; i < n; i++) {
+      const u = t[i], mu = 1 - u;
+      const A1 = 3 * mu * mu * u, A2 = 3 * mu * u * u, B0 = mu * mu * mu, B3 = u * u * u;
+      const rx = P[i][0] - B0 * P0[0] - B3 * P3[0], ry = P[i][1] - B0 * P0[1] - B3 * P3[1];
+      a11 += A1 * A1; a12 += A1 * A2; a22 += A2 * A2;
+      bx1 += A1 * rx; by1 += A1 * ry; bx2 += A2 * rx; by2 += A2 * ry;
+    }
+    const det = a11 * a22 - a12 * a12;
+    if (Math.abs(det) < 1e-12) return null;
+    C1 = [(bx1 * a22 - bx2 * a12) / det, (by1 * a22 - by2 * a12) / det];
+    C2 = [(a11 * bx2 - a12 * bx1) / det, (a11 * by2 - a12 * by1) / det];
+    // 各点に対応する位置 t を少しずつ合わせ直す（ニュートン法）
+    for (let i = 1; i < n - 1; i++) {
+      const u = t[i], mu = 1 - u;
+      const q = at(C1, C2, u);
+      const d1x = 3 * mu * mu * (C1[0] - P0[0]) + 6 * mu * u * (C2[0] - C1[0]) + 3 * u * u * (P3[0] - C2[0]);
+      const d1y = 3 * mu * mu * (C1[1] - P0[1]) + 6 * mu * u * (C2[1] - C1[1]) + 3 * u * u * (P3[1] - C2[1]);
+      const d2x = 6 * mu * (C2[0] - 2 * C1[0] + P0[0]) + 6 * u * (P3[0] - 2 * C2[0] + C1[0]);
+      const d2y = 6 * mu * (C2[1] - 2 * C1[1] + P0[1]) + 6 * u * (P3[1] - 2 * C2[1] + C1[1]);
+      const ex = q[0] - P[i][0], ey = q[1] - P[i][1];
+      const num = ex * d1x + ey * d1y, den = d1x * d1x + d1y * d1y + ex * d2x + ey * d2y;
+      if (Math.abs(den) > 1e-12) t[i] = Math.min(1, Math.max(0, u - num / den));
+    }
+  }
+  let maxErr = 0;
+  for (let i = 0; i < n; i++) maxErr = Math.max(maxErr, dist(at(C1, C2, t[i]), P[i]));
+  return { at: (u) => at(C1, C2, u), maxErr, len: polyLen([P0, C1, C2, P3]) };
+}
+
+// 開いた線をなめらかにならす（両端は動かさない）
+function smoothOpen(P, sigma) {
+  const n = P.length, out = [P[0].slice()];
+  const w = Math.ceil(sigma * 2.5);
+  for (let i = 1; i < n - 1; i++) {
+    const k = Math.min(w, i, n - 1 - i);
+    let sx = 0, sy = 0, sw = 0;
+    for (let j = -k; j <= k; j++) {
+      const g = Math.exp(-(j * j) / (2 * sigma * sigma));
+      sx += P[i + j][0] * g;
+      sy += P[i + j][1] * g;
+      sw += g;
+    }
+    out.push([sx / sw, sy / sw]);
+  }
+  out.push(P[n - 1].slice());
+  return out;
+}
+
+// ---- 閉じた図形：はっきり曲がっている所（角）を数えて形を決め、角と角のあいだに直線を当てはめて角を作り直す
+// （角が少し丸い・書き終わりが少しはみ出した、くらいでは余計な角ができない）
+function closedLoop(R, size) {
+  let P = R.slice();
+  const n = P.length;
+  // 書き終わりが書き始めを通り越していたら、いちばん近づいた所で切る
+  let best = n - 1, bd = Infinity;
+  for (let i = Math.floor(n * 0.7); i < n; i++) {
+    const d = dist(P[i], P[0]);
+    if (d < bd) {
+      bd = d;
+      best = i;
+    }
+  }
+  if (bd < size * 0.18) P = P.slice(0, best + 1);
+  return resample(P.concat([P[0].slice()]), 97).slice(0, 96);
+}
+function turnProfile(Q, w) {
+  const n = Q.length, T = new Float64Array(n);
+  for (let i = 0; i < n; i++) T[i] = Math.PI - angleAt(Q[(i - w + n) % n], Q[i], Q[(i + w) % n]);
+  return T;
+}
+// 曲がり具合の山（角の候補）を、強い順に・近すぎるものを除いて
+function cornerCands(T, minTurn, sep) {
+  const n = T.length;
+  const order = [...T.keys()].filter((i) => T[i] >= minTurn).sort((a, b) => T[b] - T[a]);
+  const out = [];
+  for (const i of order) {
+    if (out.every((j) => Math.min(Math.abs(i - j), n - Math.abs(i - j)) > sep)) out.push(i);
+  }
+  return out;
+}
+function lineCross(A, B) {
+  const det = A.ux * B.uy - A.uy * B.ux;
+  if (Math.abs(det) < 0.12) return null;
+  const dx = B.cx - A.cx, dy = B.cy - A.cy;
+  const t = (dx * B.uy - dy * B.ux) / det;
+  return [A.cx + A.ux * t, A.cy + A.uy * t];
+}
+function polyFromCorners(Q, C, size) {
+  const n = Q.length, k = C.length;
+  const lines = [];
+  for (let j = 0; j < k; j++) {
+    const a = C[j], len = (C[(j + 1) % k] - a + n) % n || n;
+    const m = Math.max(1, Math.floor(len * 0.18));
+    const pts = [];
+    for (let s = m; s <= len - m; s++) pts.push(Q[(a + s) % n]);
+    if (pts.length < 2) pts.push(Q[a], Q[(a + len) % n]);
+    lines.push(fitLine(pts));
+  }
+  const V = [];
+  for (let j = 0; j < k; j++) {
+    const p = lineCross(lines[(j - 1 + k) % k], lines[j]);
+    V.push(p && dist(p, Q[C[j]]) < size * 0.25 ? p : Q[C[j]].slice());
+  }
+  return V;
+}
+// 三角形の 1 辺がほぼ水平・垂直なら、ぴったりそろえる
+function levelTriangle(V) {
+  const c = centroidOf(V);
+  let best = null;
+  for (let i = 0; i < 3; i++) {
+    const p = V[i], q = V[(i + 1) % 3];
+    const a = Math.atan2(q[1] - p[1], q[0] - p[0]);
+    const sn = Math.round(a / (Math.PI / 2)) * (Math.PI / 2);
+    if (Math.abs(a - sn) < 0.1 && (best === null || Math.abs(a - sn) < Math.abs(best))) best = a - sn;
+  }
+  if (best === null) return V;
+  const cs = Math.cos(-best), sn = Math.sin(-best);
+  return V.map((p) => [c[0] + (p[0] - c[0]) * cs - (p[1] - c[1]) * sn, c[1] + (p[0] - c[0]) * sn + (p[1] - c[1]) * cs]);
 }
 
 const toPts = (V, r) => {
@@ -392,12 +502,21 @@ export function recognizeShape(dense, z) {
         return { kind: 'polyline', pts: toPts(V, r) };
       }
     }
-    // ---- なめらかな曲線
-    const vi = dpIdx(R, Math.max(2.5 / z, size * 0.035));
-    if (vi.length <= 14) {
-      const V = vi.map((i) => R[i].slice());
-      V[0] = S.slice();
-      V[V.length - 1] = E.slice();
+    // ---- なめらかな曲線：まず 1 本のきれいなベジェ曲線で近似できるか試す。だめなら手ぶれを強めにならす
+    const R2 = R.slice();
+    R2[0] = S.slice();
+    R2[R2.length - 1] = E.slice();
+    const bz = bezierFit(R2);
+    if (bz && bz.maxErr < Math.max(4 / z, size * 0.06)) {
+      const N = Math.max(16, Math.min(160, Math.ceil((bz.len * z) / 4)));
+      const C = [];
+      for (let i = 0; i <= N; i++) C.push(bz.at(i / N));
+      return { kind: 'curve', pts: toPts(C, r), tt: arcParams(C) };
+    }
+    const sm = smoothOpen(R2, 3);
+    const vi = dpIdx(sm, Math.max(3 / z, size * 0.05));
+    if (vi.length <= 12) {
+      const V = vi.map((i) => sm[i].slice());
       const C = catmull(V, z);
       return { kind: 'curve', pts: toPts(C, r), tt: arcParams(C) };
     }
@@ -405,15 +524,36 @@ export function recognizeShape(dense, z) {
   }
 
   // ---- 閉じた図形
-  const V = cornersClosed(R, size);
-  const pErr = V.length >= 3 ? polyErr(R, V, true) / size : Infinity;
-  const el = fitEllipse(R);
-  if ((V.length === 3 || V.length === 4) && pErr < 0.05 && (!el || pErr < el.err * 1.4)) {
-    const W = V.length === 4 ? rectify(V) : V;
-    return { kind: V.length === 4 ? 'rect' : 'triangle', pts: toPts(closeLoop(W), r), center: centroidOf(W) };
+  const Q = closedLoop(R, size);
+  const T = turnProfile(Q, 4);
+  const cand = cornerCands(T, 0.6, 5);
+  const strong = cand.filter((i) => T[i] >= 0.95).length;
+  const clear = cand.filter((i) => T[i] >= 0.8).length; // 角らしい所の数（多角形の角数を少なく見積もりすぎないため）
+  const el = fitEllipse(Q);
+  // 角がある図形：角の少ない形から順に試して、当てはまる最初のものにする（三角形が台形に、四角形が多角形にならない）
+  if (strong >= 3 || (cand.length >= 3 && !(el && el.err < 0.08))) {
+    for (let k = 3; k <= Math.min(8, cand.length); k++) {
+      const C = cand.slice(0, k).sort((x, y) => x - y);
+      let V = polyFromCorners(Q, C, size);
+      const err = polyErr(Q, V, true) / size;
+      // はっきりした角が k 個より多いのに k 角形にするのは、ほぼぴったり当てはまるときだけ（五角形が四角形にならないように）
+      if (err >= (k < clear ? 0.022 : k <= 4 ? 0.055 : 0.04)) continue;
+      if (k === 3) V = levelTriangle(V);
+      if (k === 4) V = rectify(V);
+      const kind = k === 3 ? 'triangle' : k === 4 ? 'rect' : 'polygon';
+      return { kind, pts: toPts(closeLoop(V), r), center: centroidOf(V) };
+    }
   }
-  if (el && el.err < 0.085) return { kind: 'ellipse', pts: toPts(ellipsePts(el), r), center: [el.cx, el.cy] };
-  if (V.length >= 5 && V.length <= 8 && pErr < 0.04) return { kind: 'polygon', pts: toPts(closeLoop(V), r), center: centroidOf(V) };
+  // 角のない図形：円・楕円（縦横の差が小さければ正円）
+  if (el && el.err < 0.12 && strong <= 2) {
+    const c = fitCircle(Q);
+    if (c) {
+      el.cx = c.cx;
+      el.cy = c.cy;
+      el.r = c.r;
+    }
+    return { kind: 'ellipse', pts: toPts(ellipsePts(el), r), center: [el.cx, el.cy] };
+  }
   return null;
 }
 

@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.4.3';
+export const VERSION = '1.5.0';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -16,6 +16,17 @@ function fmtBytes(b) {
 }
 
 export function openSettings(app) {
+  // 1〜10 のスライダー（5 が標準）。words = [5 より小さいときの言葉, 大きいときの言葉]
+  const levelRow = (label, key, words, hint) =>
+    ui.row(
+      label,
+      ui.slider({
+        min: 1, max: 10, step: 1, value: settings[key] || 5,
+        format: (v) => (v === 5 ? '5・標準' : `${v}・${v < 5 ? words[0] : words[1]}`),
+        onInput: (v) => { settings[key] = v; saveSettings(); },
+      }),
+      hint
+    );
   const accent = h('div', { class: 'swatches accent' });
   for (const [k, c] of Object.entries(ACCENTS)) {
     const b = h('button', { class: 'swatch' + (settings.accent === k ? ' on' : ''), 'aria-label': k });
@@ -68,6 +79,12 @@ export function openSettings(app) {
       ),
       ui.row('縮小したときの余白（上・左右）', ui.slider({ min: 0.3, max: 2.5, step: 0.05, value: settings.zoomMargin, format: (v) => v.toFixed(2) + '×', onInput: (v) => { settings.zoomMargin = v; saveSettings(); app.editor.engine.settleView(); } }), 'いちばん縮小したとき、ページのまわりに空ける幅（ツールバーの高さの何倍か）'),
       ui.row('縮小したときの余白（下）', ui.slider({ min: 0.2, max: 2.5, step: 0.05, value: settings.zoomMarginBottom, format: (v) => v.toFixed(2) + '×', onInput: (v) => { settings.zoomMarginBottom = v; saveSettings(); app.editor.engine.settleView(); } }))
+    ),
+    ui.section(
+      '移動',
+      levelRow('移動の感度', 'panLevel', ['ゆっくり', 'すばやく'], '数字を上げるほど、指を少し動かしただけで大きく移動します（5 が指の動きそのまま）'),
+      levelRow('指を離したあとの滑り', 'glideLevel', ['短め', '長め'], '指を払って離したあと、勢いで滑っていく強さと長さ'),
+      levelRow('ページのめくりやすさ', 'pageLevel', ['重い', '軽い'], '数字を下げるほど、横に払ったり引っ張ったりしても隣のページへ移りにくくなります')
     ),
     ui.section(
       '手書き',
