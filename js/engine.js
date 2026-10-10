@@ -329,6 +329,11 @@ export class Engine {
     return { minTx, maxTx, minTy, maxTy };
   }
   // ドラッグ中の範囲：横は最初〜最後のページ、縦は今のページ
+  // ズームの感度：5 で指の開き具合そのまま。1 段上げるごとに約 1.3 倍ずつ大きく拡大・縮小する
+  pinchGain() {
+    const lv = clamp(+settings.pinchLevel || 5, 1, 10);
+    return Math.pow(1.3, lv - 5);
+  }
   // 移動できる範囲（from = 操作を始めたときのページ）
   //  - 拡大してページが画面より広いとき：今のページの中だけ。端から先は引っ張ると重くなり、勢いでは隣へ行かない
   //  - ページ全体が見えているとき：横は最初〜最後のページ（左右にめくれる）
@@ -1214,7 +1219,7 @@ export class Engine {
     if (e.ctrlKey || e.metaKey) {
       const sp = this.sp(e);
       const pv = this.pvs[this.focusIndex()];
-      const nz = clamp(z * Math.exp(-e.deltaY * 0.01), pv ? this.minZoomFor(pv) : 0.1, MAX_Z);
+      const nz = clamp(z * Math.exp(-e.deltaY * 0.01 * this.pinchGain()), pv ? this.minZoomFor(pv) : 0.1, MAX_Z);
       this.wheelZoomT = now();
       const w = this.toWorld(sp);
       this.setView(sp.x - w.x * nz, sp.y - w.y * nz, nz);
@@ -1358,7 +1363,7 @@ export class Engine {
       const c = { x: (A.x + B.x) / 2, y: (A.y + B.y) / 2 };
       const d = Math.max(10, Math.hypot(A.x - B.x, A.y - B.y));
       const pv = this.pvs[this.focusIndex()];
-      const z = softZoom((g.v0.z * d) / g.d0, pv ? this.minZoomFor(pv) : 0.1);
+      const z = softZoom(g.v0.z * Math.pow(d / g.d0, this.pinchGain()), pv ? this.minZoomFor(pv) : 0.1);
       // 少しでもピンチしたら「2 本指タップ（元に戻す）」とはみなさない
       if (this.tapSess && (Math.abs(d - g.d0) > 6 || Math.hypot(c.x - g.c0.x, c.y - g.c0.y) > 6)) this.tapSess.moved = true;
       this.lastPinchC = c;
@@ -1401,18 +1406,21 @@ export class Engine {
           if (armed && !cancel) {
             this.hooks.onPullAdd && this.hooks.onPullAdd();
           } else if (pv && !this.isWide(pv, this.view.z)) {
-            // ページ全体が見えているとき：速く・はっきり横に・ある程度の距離を払ったときだけページをめくる
-            if (Math.abs(vx) > 0.55 && Math.abs(vx) > Math.abs(vy) * 1.5 && Math.abs(g.dx || 0) > 40) this.settleView({ vx, from: fi });
+            // ページ全体が見えているとき：速く・はっきり横に・ある程度の距離を払ったときだけページをめくる。
+            // ゆっくり動かして離したときは、ページの 6 割以上ずらしたときだけ隣へ
+            const dx = g.dx || 0;
+            const frac = Math.abs(dx) / ((pv.page.w + GAP) * this.view.z);
+            if (Math.abs(vx) > 0.75 && Math.abs(vx) > Math.abs(vy) * 1.8 && Math.abs(dx) > 80) this.settleView({ vx, from: fi });
             else if (Math.abs(vy) > 0.12) this.startInertia(0, vy, fi);
-            else this.settleView({ from: fi });
+            else this.settleView({ page: frac > 0.6 && this.pvs[fi + (dx < 0 ? 1 : -1)] ? fi + (dx < 0 ? 1 : -1) : fi });
           } else if (pv) {
-            // 拡大中：ページの端からさらに大きく（画面の幅の 4 割以上）引っ張って離したときだけ隣のページへ。
+            // 拡大中：ページの端からさらに大きく（画面の幅の 55% 以上）引っ張って離したときだけ隣のページへ。
             // 勢い（慣性）は今のページの端で止まる
             const b = this.dragBounds(this.view.z, fi);
             const raw = g.rawTx != null ? g.rawTx : this.view.tx;
             const over = raw > b.maxTx ? raw - b.maxTx : raw < b.minTx ? raw - b.minTx : 0;
             const to = over > 0 ? fi - 1 : fi + 1;
-            if (Math.abs(over) > A.w * 0.4 && this.pvs[to]) this.settleView({ page: to });
+            if (Math.abs(over) > A.w * 0.55 && this.pvs[to]) this.settleView({ page: to });
             else if (Math.hypot(vx, vy) > 0.12) this.startInertia(vx, vy, fi);
             else this.settleView({ page: fi });
           } else this.settleView({ from });

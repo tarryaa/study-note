@@ -26,6 +26,7 @@ export const DEFAULTS = {
   autoRevert: false,
   zoomMargin: 1.3, // いちばん縮小したときのページまわりの余白（ツールバーの高さの何倍か）
   zoomMarginBottom: 0.6,
+  pinchLevel: 5, // 2 本指ズームの感度 1〜10（5 = 指の開き具合そのまま）
   libSort: 'updated',
   libView: 'grid',
   newNote: { template: 'ruled7', paper: '#ffffff', size: 'a4p', cover: 'indigo' },

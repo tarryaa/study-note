@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.4.2';
+export const VERSION = '1.4.3';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -57,6 +57,15 @@ export function openSettings(app) {
     ),
     ui.section(
       'ズーム',
+      ui.row(
+        '2 本指ズームの感度',
+        ui.slider({
+          min: 1, max: 10, step: 1, value: settings.pinchLevel,
+          format: (v) => (v === 5 ? '5・標準' : v < 5 ? `${v}・ゆっくり` : `${v}・すばやく`),
+          onInput: (v) => { settings.pinchLevel = v; saveSettings(); },
+        }),
+        '数字を上げるほど、指を少し開閉しただけで大きく拡大・縮小します（5 が指の開き具合そのまま）'
+      ),
       ui.row('縮小したときの余白（上・左右）', ui.slider({ min: 0.3, max: 2.5, step: 0.05, value: settings.zoomMargin, format: (v) => v.toFixed(2) + '×', onInput: (v) => { settings.zoomMargin = v; saveSettings(); app.editor.engine.settleView(); } }), 'いちばん縮小したとき、ページのまわりに空ける幅（ツールバーの高さの何倍か）'),
       ui.row('縮小したときの余白（下）', ui.slider({ min: 0.2, max: 2.5, step: 0.05, value: settings.zoomMarginBottom, format: (v) => v.toFixed(2) + '×', onInput: (v) => { settings.zoomMarginBottom = v; saveSettings(); app.editor.engine.settleView(); } }))
     ),
