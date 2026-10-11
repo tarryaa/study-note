@@ -21,51 +21,37 @@
   <main>
     <div class="mark" aria-hidden="true">ノ</div>
     <h1>勉強ノートを修復</h1>
-    <p>アプリの更新を確認しています。ノートの保存データには触れません。</p>
+    <p>最新のアプリを確認しています。ノートの保存データには触れません。</p>
     <div id="status" role="status" aria-live="polite">更新を確認中…</div>
     <a href="./index.html">ノートを開く</a>
-    <small>この画面が変わらない場合は、通信状態を確認してもう一度開いてください。</small>
+    <small>このページは古いアプリのキャッシュを避けて、サーバーから読み込まれます。</small>
   </main>
   <script>
     (() => {
-      const EXPECTED = 'v1.6.3';
       const status = document.getElementById('status');
       let opening = false;
       const say = (message) => { status.textContent = message; };
       const openApp = () => {
         if (opening) return;
         opening = true;
-        say('修復できました。ノートを開いています…');
-        setTimeout(() => location.replace('./index.html?recovered=' + Date.now()), 450);
+        say('更新確認が完了しました。ノートを開いています…');
+        setTimeout(() => location.replace('./index.html?recovered=' + Date.now()), 500);
       };
-      const versionOf = (worker) => new Promise((resolve) => {
-        if (!worker) return resolve(null);
-        const channel = new MessageChannel();
-        const timer = setTimeout(() => { channel.port1.close(); resolve(null); }, 900);
-        channel.port1.onmessage = (event) => {
-          clearTimeout(timer);
-          channel.port1.close();
-          resolve(event.data);
-        };
-        try { worker.postMessage('getVersion', [channel.port2]); }
-        catch (_) { clearTimeout(timer); channel.port1.close(); resolve(null); }
-      });
       const watchInstall = (worker) => {
         if (!worker) return;
         worker.addEventListener('statechange', () => {
           if (worker.state === 'installed') {
-            say('更新を適用しています…');
+            say('修正版を適用しています…');
             worker.postMessage('skipWaiting');
           } else if (worker.state === 'activated') {
             openApp();
           } else if (worker.state === 'redundant' && !opening) {
-            say('自動更新が完了しませんでした。通信を確認して再読み込みしてください。');
+            say('更新に失敗しました。通信状態を確認して、もう一度開いてください。');
           }
         });
       };
-
       if (!('serviceWorker' in navigator)) {
-        say('このブラウザでは自動修復できません。下のボタンからノートを開いてください。');
+        say('このブラウザでは自動更新できません。Safariで開き直してください。');
         return;
       }
       navigator.serviceWorker.addEventListener('controllerchange', openApp);
@@ -73,25 +59,18 @@
         registration.addEventListener('updatefound', () => watchInstall(registration.installing));
         if (registration.installing) watchInstall(registration.installing);
         if (registration.waiting) {
-          say('更新を適用しています…');
+          say('修正版を適用しています…');
           registration.waiting.postMessage('skipWaiting');
           return;
         }
-        const active = registration.active || navigator.serviceWorker.controller;
-        if (await versionOf(active) === EXPECTED) {
-          openApp();
-          return;
-        }
-        say('修正版を取得しています…');
+        say('修正版を確認しています…');
         await registration.update();
         if (registration.waiting) {
           registration.waiting.postMessage('skipWaiting');
         } else if (registration.installing) {
           watchInstall(registration.installing);
-        } else if (await versionOf(registration.active) === EXPECTED) {
-          openApp();
         } else {
-          say('更新を確認できませんでした。通信を確認して再読み込みしてください。');
+          openApp();
         }
       }).catch(() => say('更新に接続できませんでした。通信を確認して、もう一度お試しください。'));
     })();
