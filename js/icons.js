@@ -9,6 +9,8 @@ const P = {
   folder: FOLDER,
   'folder-fill': '<path fill="currentColor" stroke="none" d="M3.5 8A2.5 2.5 0 0 1 6 5.5h3.6l2 2.3H18a2.5 2.5 0 0 1 2.5 2.5v6.7A2.5 2.5 0 0 1 18 19.5H6A2.5 2.5 0 0 1 3.5 17z"/>',
   'folder-plus': FOLDER + '<path d="M12 11.2v5.2M9.4 13.8h5.2"/>',
+  lock: '<rect x="5.5" y="10.5" width="13" height="10" rx="2"/><path d="M8.5 10.5V7.8a3.5 3.5 0 0 1 7 0v2.7M12 14v3"/>',
+  unlock: '<rect x="5.5" y="10.5" width="13" height="10" rx="2"/><path d="M8.5 10.5V7.8a3.5 3.5 0 0 1 6.2-2.2M12 14v3"/>',
   'folder-move': FOLDER + '<path d="M9 13.8h6M12.7 11.3l2.5 2.5-2.5 2.5"/>',
   inbox: '<path d="M4 13.5 6.3 6.6A1.6 1.6 0 0 1 7.8 5.5h8.4a1.6 1.6 0 0 1 1.5 1.1L20 13.5V18a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18z"/><path d="M4 13.5h4.5l1.2 2h4.6l1.2-2H20"/>',
   notes: '<rect x="5" y="3.5" width="14" height="17" rx="2.5"/><path d="M9 8.5h6M9 12h6M9 15.5h3.5"/>',

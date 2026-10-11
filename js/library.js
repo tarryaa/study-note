@@ -932,9 +932,9 @@ export class Library {
       coverPrev.querySelector('.nn-paper').style.background = st.paper;
     };
     // 「画像から」：選んだ画像 1 枚ごとに、その縦横比のページを作る
-    const fileIn = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true });
+    const fileIn = h('input', { type: 'file', accept: 'image/*,.pdf,application/pdf', multiple: true, hidden: true });
     const sizeBox = h('div', {}, h('h4', { text: 'サイズ' }), sizeChips(st));
-    const imgHint = h('p', { class: 'tp-hint', html: `${icon('img-page')}<span>選んだ画像がそのままページになります（縦横比は画像に合わせます）</span>` });
+    const imgHint = h('p', { class: 'tp-hint', html: `${icon('img-page')}<span>画像や PDF の各ページが、縦横比に合ったページとして追加されます</span>` });
     const sync = () => {
       sizeBox.hidden = st.template === 'image';
       imgHint.hidden = st.template !== 'image';
@@ -993,7 +993,7 @@ export class Library {
         if (!specs.length) {
           okBtn.disabled = false;
           okBtn.innerHTML = `${icon('sparkle')}<span>作成して開く</span>`;
-          ui.toast('画像を読み込めませんでした', { icon: 'info' });
+          ui.toast('画像または PDF を読み込めませんでした', { icon: 'info' });
           return;
         }
         extra = { pageSpecs: specs, assets };

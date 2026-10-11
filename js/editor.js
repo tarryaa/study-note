@@ -10,6 +10,7 @@ import { renderThumb } from './render.js';
 import { PEN_TYPES, LiveStroke } from './ink.js';
 import { SHAPE_KINDS, shapeSvg } from './shapes.js';
 import * as exporter from './exporter.js';
+import { isPdfFile, renderPdfPages } from './pdf-import.js';
 import { templateGrid, paperSwatches, sizeChips, sizeKeyOf } from './pickers.js';
 
 const TOOLS = [
@@ -103,15 +104,17 @@ export function imagePageSize(w, hh) {
 }
 
 // 画像ファイル → ページの元データ（背景画像アセット付き）
-export async function imagesToPageSpecs(files, noteId) {
+export async function imagesToPageSpecs(files, noteId, { firstPdfPage = false } = {}) {
   const specs = [], assets = [];
   for (const f of files) {
     try {
-      const { blob, w, h: hh } = await prepareImage(f, { max: 3200, q: 0.92 });
-      const id = uid();
-      assets.push({ id, noteId, blob, w, h: hh, type: blob.type });
-      const sz = imagePageSize(w, hh);
-      specs.push({ template: 'blank', paper: '#ffffff', w: sz.w, h: sz.h, bg: id });
+      const pages = isPdfFile(f) ? await renderPdfPages(f, { firstOnly: firstPdfPage }) : [await prepareImage(f, { max: 3200, q: 0.92 })];
+      for (const page of pages) {
+        const id = uid();
+        assets.push({ id, noteId, blob: page.blob, w: page.w, h: page.h, type: page.blob.type });
+        const sz = imagePageSize(page.w, page.h);
+        specs.push({ template: 'blank', paper: '#ffffff', w: sz.w, h: sz.h, bg: id });
+      }
     } catch (e) {
       console.warn(e);
     }
@@ -132,6 +135,7 @@ export class Editor {
     this.thumbCache = new WeakMap();
     this.prevTool = 'pen';
     this.stamps = [];
+    this.stampFolders = [];
     this.stampsLoaded = false;
     this.stampCache = new Map();
     this.stampAssetMap = new Map();
@@ -207,7 +211,7 @@ export class Editor {
     this.pageNav = h('div', { class: 'page-nav glass' }, this.pnStrip, this.pnToggle);
 
     this.zoomInd = h('div', { class: 'zoom-ind' });
-    this.fileInput = h('input', { type: 'file', accept: 'image/*', hidden: true });
+    this.fileInput = h('input', { type: 'file', accept: 'image/*,.pdf,application/pdf', hidden: true });
     this.fileInput.addEventListener('change', () => {
       const f = this.fileInput.files && this.fileInput.files[0];
       this.fileInput.value = '';
@@ -624,15 +628,19 @@ export class Editor {
         }
       );
       mode.classList.add('mini');
-      o.append(mode);
+      const locked = this.engine.pvs.reduce((n, pv) => n + pv.page.items.filter((it) => it.locked).length, 0);
+      const manage = h('button', { class: 'slot lock-manager', title: `ロック中の素材 ${locked} 個`, 'aria-label': `ロック中の素材 ${locked} 個`, html: icon('lock') });
+      if (locked) manage.append(h('span', { class: 'lock-count', text: locked > 99 ? '99+' : String(locked) }));
+      manage.addEventListener('click', () => this.lockedItemsPanel(manage));
+      o.append(mode, sep(), manage);
     } else if (tool === 'stamp') {
       const t = T.stamp;
       const list = h('div', { class: 'slots stamps' });
-      const recent = this.stamps.slice(0, 5);
+      const recent = this.stamps.slice(0, 4);
       if (t.id && !this.stamps.some((s) => s.id === t.id)) t.id = null;
       if (!t.id && recent[0]) t.id = recent[0].id;
       for (const s of recent) {
-        const b = h('button', { class: 'slot stamp' + (s.id === t.id ? ' on' : ''), title: 'スタンプ' }, h('img', { src: this.stampThumb(s), alt: '' }));
+        const b = h('button', { class: 'slot stamp' + (s.id === t.id ? ' on' : ''), title: s.title || 'スタンプ' }, h('img', { src: this.stampThumb(s), alt: '' }));
         b.addEventListener('click', () => {
           if (t.id === s.id) return this.stampPanel(b);
           t.id = s.id;
@@ -646,6 +654,25 @@ export class Editor {
       all.addEventListener('click', () => this.stampPanel(all));
       o.append(list, sep(), all);
     }
+  }
+  lockedItemsPanel(anchor) {
+    const locked = [];
+    this.engine.pvs.forEach((pv, pageIndex) => pv.page.items.forEach((it) => { if (it.locked) locked.push({ pv, pageIndex, it }); }));
+    const list = h('div', { class: 'locked-list' });
+    if (!locked.length) list.append(h('p', { class: 'tp-hint', text: 'ロック中の素材はありません。なげなわで選択して「ロック」を押すと、ここに表示されます。' }));
+    for (const { pv, pageIndex, it } of locked) {
+      const label = it.name || (it.t === 'x' ? (it.text || 'テキスト').slice(0, 28) : it.t === 'i' ? '画像' : it.k ? `図形：${SHAPE_LABEL[it.k] || it.k}` : '手書き');
+      const row = h('button', { class: 'locked-row' }, h('span', { class: 'locked-row-ic', html: icon('lock') }), h('span', { class: 'locked-row-name', text: label }), h('small', { text: `P.${pageIndex + 1}` }));
+      row.addEventListener('click', () => {
+        const i = this.engine.pvs.indexOf(pv);
+        this.engine.goToPage(i, { anim: false });
+        this.engine.ensureVisible(pv, it.bb);
+        this.engine.select(pv, [it], { includeLocked: true });
+        pop.close();
+      });
+      list.append(row);
+    }
+    const pop = ui.popover(anchor, h('div', { class: 'tool-panel lock-panel' }, h('div', { class: 'tp-head' }, h('div', { class: 'tp-label', text: 'ロック中の素材' }), h('span', { class: 'muted', text: `${locked.length} 個` })), list), { placement: this.popPlacement(), className: 'tool-pop' });
   }
   previewOpts(tool) {
     const T = settings.tools;
@@ -1115,12 +1142,12 @@ export class Editor {
   }
   async addImagePages(index, files) {
     if (!this.note || !files || !files.length) return;
-    const dismiss = ui.toast('画像を読み込み中…', { duration: 60000, icon: 'img-page' });
+    const dismiss = ui.toast('画像・PDFを読み込み中…', { duration: 60000, icon: 'img-page' });
     const note = this.note;
     const { specs, assets } = await imagesToPageSpecs(files, note.id);
     dismiss();
     if (this.note !== note || !specs.length) {
-      if (!specs.length) ui.toast('画像を読み込めませんでした', { icon: 'info' });
+      if (!specs.length) ui.toast('画像または PDF を読み込めませんでした', { icon: 'info' });
       return;
     }
     for (const a of assets) {
@@ -1137,7 +1164,7 @@ export class Editor {
     const note = this.note;
     const page = this.engine.pages()[index];
     if (!note || !page) return;
-    const { specs, assets } = await imagesToPageSpecs([file], note.id);
+    const { specs, assets } = await imagesToPageSpecs([file], note.id, { firstPdfPage: true });
     if (!specs.length || this.note !== note) return;
     const a = assets[0];
     await store.saveAsset(a);
@@ -1154,10 +1181,10 @@ export class Editor {
     const sp = { ...settings.tplSp };
     if (store.TPL_SP[ref.template]) sp[tpl] = store.tplSpacing(ref);
     const st = { template: tpl, sp, paper: ref.paper, size: sizeKeyOf(ref.w, ref.h) || 'a4p', scope: 'this', images: null };
-    const fileIn = h('input', { type: 'file', accept: 'image/*', hidden: true });
+    const fileIn = h('input', { type: 'file', accept: 'image/*,.pdf,application/pdf', hidden: true });
     if (mode === 'add') fileIn.multiple = true;
     const sizeBox = h('div', {}, h('h4', { text: 'サイズ' }), sizeChips(st));
-    const imgHint = h('p', { class: 'tp-hint', html: `${icon('img-page')}<span>画像の縦横比に合わせたページになります${mode === 'add' ? '（複数選ぶと 1 枚ずつページに）' : ''}</span>` });
+    const imgHint = h('p', { class: 'tp-hint', html: `${icon('img-page')}<span>画像や PDF をページ背景として取り込みます${mode === 'add' ? '（PDF は全ページを追加）' : '（PDF は1ページ目を使用）'}</span>` });
     const sync = () => {
       const img = st.template === 'image';
       sizeBox.hidden = img;
@@ -1229,9 +1256,10 @@ export class Editor {
   async loadStamps() {
     if (this.stampsLoaded) return;
     try {
-      this.stamps = await store.loadStamps();
+      [this.stamps, this.stampFolders] = await Promise.all([store.loadStamps(), store.loadStampFolders()]);
     } catch (_) {
       this.stamps = [];
+      this.stampFolders = [];
     }
     this.stampsLoaded = true;
   }
@@ -1269,59 +1297,131 @@ export class Editor {
   async saveSelectionAsStamp() {
     const E = this.engine, s = E.sel;
     if (!s) return;
-    const bb = s.bb;
-    const cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
-    const items = s.items.map((it) => translateItem(store.cloneItem(it), -cx, -cy));
-    const assets = [];
-    for (const it of s.items) {
-      if (it.t !== 'i' || assets.some((a) => a.id === it.asset)) continue;
-      const e = E.assets.get(it.asset);
-      if (e && e.blob) assets.push({ id: it.asset, blob: e.blob, w: e.w, h: e.h, type: e.blob.type });
-    }
-    const src = E.selectionCanvas(2, true);
-    const sc = Math.min(1, 200 / Math.max(src.width, src.height));
-    const tcv = document.createElement('canvas');
-    tcv.width = Math.max(1, Math.round(src.width * sc));
-    tcv.height = Math.max(1, Math.round(src.height * sc));
-    tcv.getContext('2d').drawImage(src, 0, 0, tcv.width, tcv.height);
-    const thumb = await canvasToBlob(tcv, 'image/png');
-    const stamp = { id: uid(), items, bb: [bb[0] - cx, bb[1] - cy, bb[2] - cx, bb[3] - cy], assets, thumb, createdAt: Date.now() };
-    try {
-      await store.saveStamp(stamp);
-    } catch (e) {
-      ui.toast('スタンプを保存できませんでした', { icon: 'info' });
-      return;
-    }
-    this.stamps.unshift(stamp);
-    settings.tools.stamp.id = stamp.id;
-    saveSettings();
-    if (settings.tool === 'stamp') this.renderDock();
-    ui.toast('スタンプに保存しました', { icon: 'stamp', action: '使う', onAction: () => this.setTool('stamp') });
+    if (!this.stampFolders) this.stampFolders = [];
+    const title = h('input', { class: 'input', type: 'text', placeholder: '例：重要な式', value: `スタンプ ${this.stamps.length + 1}`, maxlength: '60' });
+    const folder = h('select', { class: 'input' }, h('option', { value: '', text: '未分類' }));
+    for (const f of this.stampFolders) folder.append(h('option', { value: f.id, text: f.name }));
+    if (this.stampFolders.some((f) => f.id === settings.tools.stamp.folderId)) folder.value = settings.tools.stamp.folderId;
+    const newFolder = h('button', { class: 'pill-btn', html: `${icon('folder-plus')}<span>新しいフォルダ</span>` });
+    newFolder.addEventListener('click', async () => {
+      const name = await ui.promptDialog({ title: 'スタンプフォルダを作成', placeholder: 'フォルダ名' });
+      if (!name) return;
+      const f = { id: uid(), name, createdAt: Date.now() };
+      await store.saveStampFolder(f);
+      this.stampFolders.push(f);
+      folder.append(h('option', { value: f.id, text: f.name }));
+      folder.value = f.id;
+    });
+    const body = h('div', { class: 'stamp-save-form' }, h('label', { text: 'スタンプ名' }), title, h('label', { text: '保存先フォルダ' }), folder, newFolder);
+    const saveBtn = h('button', { class: 'btn primary', text: '保存' });
+    const cancelBtn = h('button', { class: 'btn', text: 'キャンセル' });
+    const sheet = ui.sheet({ title: 'スタンプを保存', body, foot: [cancelBtn, saveBtn], className: 'dialog' });
+    cancelBtn.addEventListener('click', () => sheet.close());
+    saveBtn.addEventListener('click', async () => {
+      if (!title.value.trim() || E.sel !== s) return;
+      saveBtn.disabled = true;
+      sheet.close();
+      const bb = s.bb;
+      const cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
+      const items = s.items.map((it) => translateItem(store.cloneItem(it), -cx, -cy));
+      const assets = [];
+      for (const it of s.items) {
+        if (it.t !== 'i' || assets.some((a) => a.id === it.asset)) continue;
+        const e = E.assets.get(it.asset);
+        if (e && e.blob) assets.push({ id: it.asset, blob: e.blob, w: e.w, h: e.h, type: e.blob.type });
+      }
+      const src = E.selectionCanvas(2, true);
+      if (!src) return;
+      const sc = Math.min(1, 320 / Math.max(src.width, src.height));
+      const tcv = document.createElement('canvas');
+      tcv.width = Math.max(1, Math.round(src.width * sc));
+      tcv.height = Math.max(1, Math.round(src.height * sc));
+      tcv.getContext('2d').drawImage(src, 0, 0, tcv.width, tcv.height);
+      const thumb = await canvasToBlob(tcv, 'image/png');
+      const stamp = { id: uid(), title: title.value.trim(), folderId: folder.value || null, items, bb: [bb[0] - cx, bb[1] - cy, bb[2] - cx, bb[3] - cy], assets, thumb, createdAt: Date.now() };
+      try {
+        await store.saveStamp(stamp);
+      } catch (e) {
+        ui.toast('スタンプを保存できませんでした', { icon: 'info' });
+        return;
+      }
+      this.stamps.unshift(stamp);
+      settings.tools.stamp.id = stamp.id;
+      saveSettings();
+      if (settings.tool === 'stamp') this.renderDock();
+      ui.toast('スタンプを保存しました', { icon: 'stamp', action: '使う', onAction: () => this.setTool('stamp') });
+    });
   }
   stampPanel(anchor) {
     const t = settings.tools.stamp;
-    let editing = false;
+    let editing = false, filter = t.folderId || '*';
+    if (filter !== '*' && filter !== '' && !this.stampFolders.some((f) => f.id === filter)) filter = '*';
     const grid = h('div', { class: 'stamp-grid' });
+    const folderSel = h('select', { class: 'input stamp-folder-select', 'aria-label': 'スタンプフォルダ' });
+    const fillFolders = () => {
+      folderSel.innerHTML = '';
+      folderSel.append(h('option', { value: '*', text: 'すべてのフォルダ' }), h('option', { value: '', text: '未分類' }));
+      for (const f of this.stampFolders) folderSel.append(h('option', { value: f.id, text: f.name }));
+      folderSel.value = filter;
+    };
+    fillFolders();
+    const editStamp = (s) => {
+      const name = h('input', { class: 'input', type: 'text', value: s.title || 'スタンプ', maxlength: '60' });
+      const dest = h('select', { class: 'input' }, h('option', { value: '', text: '未分類' }));
+      for (const f of this.stampFolders) dest.append(h('option', { value: f.id, text: f.name }));
+      dest.value = s.folderId || '';
+      const add = h('button', { class: 'pill-btn', html: `${icon('folder-plus')}<span>フォルダ作成</span>` });
+      add.addEventListener('click', async () => {
+        const folderName = await ui.promptDialog({ title: 'スタンプフォルダを作成', placeholder: 'フォルダ名' });
+        if (!folderName) return;
+        const f = { id: uid(), name: folderName, createdAt: Date.now() };
+        await store.saveStampFolder(f);
+        this.stampFolders.push(f);
+        dest.append(h('option', { value: f.id, text: f.name }));
+        dest.value = f.id;
+      });
+      const save = h('button', { class: 'btn primary', text: '保存' });
+      const cancel = h('button', { class: 'btn', text: 'キャンセル' });
+      const sheet = ui.sheet({ title: 'スタンプを編集', body: h('div', { class: 'stamp-save-form' }, h('label', { text: 'スタンプ名' }), name, h('label', { text: '保存先フォルダ' }), dest, add), foot: [cancel, save], className: 'dialog' });
+      cancel.addEventListener('click', () => sheet.close());
+      save.addEventListener('click', async () => {
+        if (!name.value.trim()) return;
+        s.title = name.value.trim();
+        s.folderId = dest.value || null;
+        await store.saveStamp(s);
+        sheet.close();
+        render();
+        this.renderDock();
+      });
+    };
     const render = () => {
       grid.innerHTML = '';
       grid.classList.toggle('editing', editing);
-      if (!this.stamps.length) {
+      const shown = this.stamps.filter((s) => filter === '*' || (filter ? s.folderId === filter : !s.folderId));
+      if (!shown.length) {
         grid.append(h('p', { class: 'tp-hint', html: `${icon('lasso')}<span>なげなわで囲んで、メニューの「スタンプ」を押すと保存できます</span>` }));
         return;
       }
-      for (const s of this.stamps) {
-        const b = h('button', { class: 'stamp-cell' + (s.id === t.id ? ' on' : '') }, h('img', { src: this.stampThumb(s), alt: '' }), h('span', { class: 'stamp-x', html: icon('x') }));
+      for (const s of shown) {
+        const b = h('button', { class: 'stamp-cell' + (s.id === t.id ? ' on' : ''), title: s.title || 'スタンプ' }, h('img', { src: this.stampThumb(s), alt: '' }), h('span', { class: 'stamp-title', text: s.title || 'スタンプ' }), h('span', { class: 'stamp-x', html: icon('more') }));
         b.addEventListener('click', async () => {
           if (editing) {
-            await store.deleteStamp(s.id);
-            this.stamps = this.stamps.filter((x) => x !== s);
-            const c = this.stampCache.get(s.id);
-            if (c && c.thumb) URL.revokeObjectURL(c.thumb);
-            this.stampCache.delete(s.id);
-            if (t.id === s.id) t.id = this.stamps[0] ? this.stamps[0].id : null;
-            saveSettings();
-            render();
-            this.renderDock();
+            ui.menu(b, [
+              { icon: 'edit', label: '名前・フォルダを変更', action: () => editStamp(s) },
+              { icon: 'trash', label: 'スタンプを削除', danger: true, action: async () => {
+                const ok = await ui.confirmDialog({ title: 'スタンプを削除', message: `「${s.title || 'スタンプ'}」を削除します。`, ok: '削除', danger: true });
+                if (!ok) return;
+                await store.deleteStamp(s.id);
+                this.stamps = this.stamps.filter((x) => x !== s);
+                const c = this.stampCache.get(s.id);
+                if (c && c.thumb) URL.revokeObjectURL(c.thumb);
+                this.stampCache.delete(s.id);
+                if (t.id === s.id) t.id = this.stamps[0] ? this.stamps[0].id : null;
+                saveSettings();
+                render();
+                this.renderDock();
+              } },
+            ]);
             return;
           }
           t.id = s.id;
@@ -1334,6 +1434,52 @@ export class Editor {
       }
     };
     render();
+    const addFolderBtn = h('button', { class: 'pill-btn', html: `${icon('folder-plus')}<span>フォルダ作成</span>` });
+    addFolderBtn.addEventListener('click', async () => {
+      const name = await ui.promptDialog({ title: 'スタンプフォルダを作成', placeholder: 'フォルダ名' });
+      if (!name) return;
+      const f = { id: uid(), name, createdAt: Date.now() };
+      await store.saveStampFolder(f);
+      this.stampFolders.push(f);
+      filter = f.id;
+      t.folderId = filter;
+      saveSettings();
+      fillFolders();
+      render();
+    });
+    const folderEditBtn = h('button', { class: 'ib sm', title: 'フォルダ名の変更・削除', html: icon('more') });
+    folderEditBtn.addEventListener('click', () => {
+      const f = this.stampFolders.find((x) => x.id === folderSel.value);
+      if (!f) return ui.toast('変更するフォルダを選んでください', { icon: 'info' });
+      ui.menu(folderEditBtn, [
+        { icon: 'edit', label: 'フォルダ名を変更', action: async () => {
+          const name = await ui.promptDialog({ title: 'フォルダ名を変更', value: f.name, placeholder: 'フォルダ名' });
+          if (!name) return;
+          f.name = name;
+          await store.saveStampFolder(f);
+          fillFolders();
+        } },
+        { icon: 'trash', label: 'フォルダを削除', danger: true, action: async () => {
+          const ok = await ui.confirmDialog({ title: 'フォルダを削除', message: '中のスタンプは未分類に移動します。', ok: '削除', danger: true });
+          if (!ok) return;
+          const moved = this.stamps.filter((s) => s.folderId === f.id);
+          for (const s of moved) { s.folderId = null; await store.saveStamp(s); }
+          await store.deleteStampFolder(f.id);
+          this.stampFolders = this.stampFolders.filter((x) => x.id !== f.id);
+          filter = '*';
+          t.folderId = filter;
+          saveSettings();
+          fillFolders();
+          render();
+        } },
+      ]);
+    });
+    folderSel.addEventListener('change', () => {
+      filter = folderSel.value;
+      t.folderId = filter;
+      saveSettings();
+      render();
+    });
     const editBtn = h('button', { class: 'pill-btn', text: '編集' });
     editBtn.addEventListener('click', () => {
       editing = !editing;
@@ -1345,6 +1491,7 @@ export class Editor {
       'div',
       { class: 'tool-panel' },
       h('div', { class: 'tp-head' }, h('div', { class: 'tp-label', text: 'スタンプ' }), this.stamps.length ? editBtn : null),
+      h('div', { class: 'stamp-folder-row' }, folderSel, addFolderBtn, folderEditBtn),
       grid,
       ui.row('大きさ', ui.slider({ min: 0.25, max: 3, step: 0.05, value: t.scale || 1, format: (v) => Math.round(v * 100) + '%', onInput: (v) => { t.scale = v; saveSettings(); } })),
       h('p', { class: 'tp-hint', html: `${icon('stamp')}<span>ページをタップすると貼れます。ペンを置いたまま動かすと位置を調整できます</span>` })
@@ -1390,6 +1537,10 @@ export class Editor {
   }
   async insertImageFile(file) {
     if (!this.note) return;
+    if (isPdfFile(file)) {
+      await this.addImagePages(this.engine.currentIndex() + 1, [file]);
+      return;
+    }
     try {
       const { blob, w, h: hh } = await prepareImage(file);
       const asset = { id: uid(), noteId: this.note.id, blob, w, h: hh, type: blob.type };
@@ -1398,7 +1549,7 @@ export class Editor {
       this.engine.assets.set(asset.id, entry);
       await entry.ready;
       if (settings.tool !== 'lasso') this.setTool('lasso');
-      this.engine.insertImage(asset.id, w, hh);
+      this.engine.insertImage(asset.id, w, hh, file.name || '画像');
     } catch (e) {
       console.warn(e);
       ui.toast('画像を読み込めませんでした', { icon: 'info' });

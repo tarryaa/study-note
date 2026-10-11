@@ -223,6 +223,7 @@ class App {
     try {
       const r = await exporter.importBackup(file);
       this.editor.stampsLoaded = false;
+      this.editor.stampFolders = [];
       dismiss();
       ui.toast(`${r.notes} 冊のノートを読み込みました`, { icon: 'check' });
       this.library.render(true);

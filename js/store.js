@@ -309,9 +309,14 @@ export function notifyNotes() {
 
 // ---------- スタンプ（全ノート共通） ----------
 export async function loadStamps() {
-  const list = (await db.getAll('stamps')) || [];
+  const list = ((await db.getAll('stamps')) || []).filter((s) => s.type !== 'folder');
   for (const s of list) for (const it of s.items || []) if (it.pts && !(it.pts instanceof Float32Array)) it.pts = Float32Array.from(it.pts);
   return list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 export const saveStamp = (s) => db.put('stamps', s);
 export const deleteStamp = (id) => db.del('stamps', id);
+export async function loadStampFolders() {
+  return ((await db.getAll('stampFolders')) || []).sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ja'));
+}
+export const saveStampFolder = (folder) => db.put('stampFolders', folder);
+export const deleteStampFolder = (id) => db.del('stampFolders', id);

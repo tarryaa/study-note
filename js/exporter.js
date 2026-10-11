@@ -95,7 +95,7 @@ export async function exportBackup(noteIds, onProgress) {
   const all = !noteIds;
   const notes = all ? store.state.notes.slice() : noteIds.map(store.getNote).filter(Boolean);
   const folders = all ? store.state.folders.slice() : [];
-  const out = { magic: MAGIC, version: 2, exportedAt: Date.now(), folders, notes, pages: [], assets: [], stamps: [] };
+  const out = { magic: MAGIC, version: 3, exportedAt: Date.now(), folders, notes, pages: [], assets: [], stamps: [], stampFolders: [] };
   let i = 0;
   for (const n of notes) {
     const pages = await store.loadPages(n.id);
@@ -105,6 +105,7 @@ export async function exportBackup(noteIds, onProgress) {
     onProgress && onProgress(++i, notes.length);
   }
   if (all) {
+    out.stampFolders = await store.loadStampFolders();
     for (const s of await store.loadStamps()) {
       out.stamps.push({
         ...s,
@@ -155,6 +156,7 @@ export async function importBackup(file) {
     }
     ops.push({ store: 'stamps', put: rec });
   }
+  for (const f of data.stampFolders || []) ops.push({ store: 'stampFolders', put: f });
   for (let k = 0; k < ops.length; k += 200) await db.batch(ops.slice(k, k + 200));
   await store.loadAll();
   store.notifyNotes();

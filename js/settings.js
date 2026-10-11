@@ -36,12 +36,12 @@ export const DEFAULTS = {
   newNote: { template: 'ruled7', paper: '#ffffff', size: 'a4p', cover: 'indigo' },
   tplSp: {}, // テンプレートごとに最後に選んだ間隔（mm）
   tools: {
-    pen: { colors: ['#1d1d1f', '#1f5fd1', '#e5484d', '#1f8a4c'], ci: 0, widths: [1.2, 2.2, 4], wi: 1, type: 'fountain', sens: 1 },
-    hl: { colors: ['#ffd60a', '#7ee0a1', '#ff9ec7', '#8cc8ff'], ci: 0, widths: [10, 16, 26], wi: 1, alpha: 0.38, straight: false },
+    pen: { colors: ['#1d1d1f', '#1f5fd1', '#e5484d', '#1f8a4c', '#8a5cf6', '#ef7a2d'], ci: 0, widths: [1.2, 2.2, 4], wi: 1, type: 'fountain', sens: 1 },
+    hl: { colors: ['#ffd60a', '#7ee0a1', '#ff9ec7', '#8cc8ff', '#c6a5ff', '#ffb08a'], ci: 0, widths: [10, 16, 26], wi: 1, alpha: 0.38, straight: false },
     eraser: { mode: 'partial', sizes: [10, 24, 48], si: 1, hlOnly: false },
     lasso: { mode: 'free' },
     shape: { kind: 'rect', colors: ['#1d1d1f', '#1f5fd1', '#e5484d', '#1f8a4c'], ci: 0, widths: [1.5, 2.5, 4.5], wi: 1, fill: 'none', square: false },
-    stamp: { id: null, scale: 1 },
+    stamp: { id: null, scale: 1, folderId: null },
     text: { colors: ['#1d1d1f', '#1f5fd1', '#e5484d', '#1f8a4c'], ci: 0, sizes: [14, 20, 30], si: 1 },
   },
   tool: 'pen',
@@ -52,7 +52,7 @@ export const DEFAULTS = {
 };
 
 function merge(d, s) {
-  if (Array.isArray(d)) return Array.isArray(s) && s.length === d.length ? s : d.slice();
+  if (Array.isArray(d)) return Array.isArray(s) ? d.map((v, i) => (s[i] === undefined ? v : s[i])) : d.slice();
   if (d && typeof d === 'object') {
     const o = {};
     for (const k in d) o[k] = merge(d[k], s && typeof s === 'object' ? s[k] : undefined);

@@ -70,6 +70,48 @@ function polyPath(pts) {
   P.closePath();
   return P;
 }
+function pointSegDist2(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, d = dx * dx + dy * dy;
+  const t = d ? clamp(((px - ax) * dx + (py - ay) * dy) / d, 0, 1) : 0;
+  const x = ax + dx * t, y = ay + dy * t;
+  return (px - x) ** 2 + (py - y) ** 2;
+}
+function orient(ax, ay, bx, by, cx, cy) { return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax); }
+function segmentsCross(ax, ay, bx, by, cx, cy, dx, dy) {
+  const a = orient(ax, ay, bx, by, cx, cy), b = orient(ax, ay, bx, by, dx, dy);
+  const c = orient(cx, cy, dx, dy, ax, ay), d = orient(cx, cy, dx, dy, bx, by);
+  const eps = 1e-8;
+  const on = (x, y, px, py, qx, qy) => x >= Math.min(px, qx) - eps && x <= Math.max(px, qx) + eps && y >= Math.min(py, qy) - eps && y <= Math.max(py, qy) + eps;
+  if (((a > eps && b < -eps) || (a < -eps && b > eps)) && ((c > eps && d < -eps) || (c < -eps && d > eps))) return true;
+  return (Math.abs(a) <= eps && on(cx, cy, ax, ay, bx, by)) || (Math.abs(b) <= eps && on(dx, dy, ax, ay, bx, by)) ||
+    (Math.abs(c) <= eps && on(ax, ay, cx, cy, dx, dy)) || (Math.abs(d) <= eps && on(bx, by, cx, cy, dx, dy));
+}
+function pointNearPoly(x, y, poly, pad) {
+  if (pointInPoly(x, y, poly)) return true;
+  const d2 = pad * pad;
+  for (let i = 0, j = poly.length - 2; i < poly.length; j = i, i += 2) {
+    if (pointSegDist2(x, y, poly[j], poly[j + 1], poly[i], poly[i + 1]) <= d2) return true;
+  }
+  return false;
+}
+function polyTouchesRect(poly, b, pad = 0) {
+  const x0 = b[0] - pad, y0 = b[1] - pad, x1 = b[2] + pad, y1 = b[3] + pad;
+  for (let i = 0; i < poly.length; i += 2) if (poly[i] >= x0 && poly[i] <= x1 && poly[i + 1] >= y0 && poly[i + 1] <= y1) return true;
+  const corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  if (corners.some(([x, y]) => pointInPoly(x, y, poly))) return true;
+  for (let i = 0, j = poly.length - 2; i < poly.length; j = i, i += 2) {
+    const ax = poly[j], ay = poly[j + 1], bx = poly[i], by = poly[i + 1];
+    for (let k = 0; k < 4; k++) {
+      const [cx, cy] = corners[k], [dx, dy] = corners[(k + 1) % 4];
+      if (segmentsCross(ax, ay, bx, by, cx, cy, dx, dy)) return true;
+      if (pad > 0 && Math.min(
+        pointSegDist2(ax, ay, cx, cy, dx, dy), pointSegDist2(bx, by, cx, cy, dx, dy),
+        pointSegDist2(cx, cy, ax, ay, bx, by), pointSegDist2(dx, dy, ax, ay, bx, by)
+      ) <= pad * pad) return true;
+    }
+  }
+  return false;
+}
 
 export function transformItem(it, cx, cy, m) {
   const cos = Math.cos(m.r), sin = Math.sin(m.r), s = m.s;
@@ -173,11 +215,27 @@ export class Engine {
     st.addEventListener('pointercancel', (e) => this.onUp(e, true));
     st.addEventListener('lostpointercapture', (e) => {
       const a = this.action;
-      if (a && a.pointerId === e.pointerId && e.pointerType !== 'touch') this.onUp(e, false);
+      if (!a || a.pointerId !== e.pointerId) return;
+      if (e.pointerType === 'touch') this.touchUp(e, false);
+      else this.onUp(e, false);
     });
     st.addEventListener('pointerleave', (e) => {
       if (e.pointerType !== 'touch' && !this.action) this.hideCursor();
     });
+    const endPointer = (e) => {
+      // stage 内で始まった入力は pointer capture により stage に届くので、そこで一度だけ終了する。
+      if (this.stage.contains(e.target)) return;
+      if (e.pointerType === 'touch') {
+        // ツールバー上の指は bindOutsideTouches 側で終了させる。
+        if (this.outside && this.outside.has(e.pointerId)) return;
+        if (this.touches.has(e.pointerId)) this.touchUp(e, e.type === 'pointercancel');
+      } else if (this.action && this.action.pointerId === e.pointerId) this.onUp(e, e.type === 'pointercancel');
+    };
+    document.addEventListener('pointerup', endPointer, true);
+    document.addEventListener('pointercancel', endPointer, true);
+    const recover = () => this.resetInputState();
+    window.addEventListener('blur', recover);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') recover(); });
     const pd = (e) => {
       if (!this.isUi(e.target)) e.preventDefault();
     };
@@ -1484,10 +1542,27 @@ export class Engine {
   setTool(t) {
     if (this.tool === t) return;
     if (this.action) this.cancelAction();
+    if (this.touches.size || this.tg || this.tapSess || this.mousePan) this.resetInputState();
     this.commitText();
     if (t !== 'lasso') this.clearSelection();
     this.tool = t;
     this.hideCursor();
+  }
+  resetInputState() {
+    // 画面切替で pointerup を失った場合も、書きかけの線は残す。
+    if (this.action && this.action.kind === 'stroke') this.endAction(this.action, null, false);
+    else if (this.action) this.cancelAction();
+    const shouldSettle = !!(this.mousePan || (this.tg && (this.tg.mode === 'pan' || this.tg.mode === 'pinch')));
+    this.touches.clear();
+    this.tg = null;
+    this.tapSess = null;
+    this.mousePan = null;
+    this.setPull(0);
+    if (this.outside) this.outside.clear();
+    this.clearInk();
+    this.clearFx();
+    this.resetInkStyle();
+    if (shouldSettle) this.settleView({ instant: true });
   }
   begin(e) {
     const sp = this.sp(e);
@@ -2358,7 +2433,7 @@ export class Engine {
     const items = pv.page.items;
     for (let i = items.length - 1; i >= 0; i--) {
       const it = items[i];
-      if (it.t !== 's' || (T.hlOnly && it.k !== 'hl')) continue;
+      if (it.locked || it.t !== 's' || (T.hlOnly && it.k !== 'hl')) continue;
       if (!hitStrokeCircle(it, x, y, R)) continue;
       if (T.mode === 'stroke') {
         this.beginEdit(pv);
@@ -2466,7 +2541,7 @@ export class Engine {
       const its = pv.page.items;
       for (let i = its.length - 1; i >= 0; i--) {
         const it = its[i];
-        if (it.t === 's' ? hitStrokeCircle(it, x, y, 7 / z) || (it.f && pointInPoly(x, y, Array.from(it.pts).filter((_, k) => k % 3 !== 2))) : hitBox(it, x, y, 4 / z)) {
+        if (!it.locked && (it.t === 's' ? hitStrokeCircle(it, x, y, 12 / z) || (it.f && pointInPoly(x, y, Array.from(it.pts).filter((_, k) => k % 3 !== 2))) : hitBox(it, x, y, 9 / z))) {
           items = [it];
           break;
         }
@@ -2482,29 +2557,38 @@ export class Engine {
       }
       if (x1 - x0 < 3 / z && y1 - y0 < 3 / z) return;
       const pbb = [x0, y0, x1, y1];
-      for (const it of pv.page.items) if (this.inLasso(it, P, pbb)) items.push(it);
+      for (const it of pv.page.items) if (!it.locked && this.inLasso(it, P, pbb)) items.push(it);
     }
     if (items.length) this.select(pv, items);
   }
   inLasso(it, P, pbb) {
+    if (it.locked) return false;
     const b = it.bb;
-    if (b[2] < pbb[0] || b[0] > pbb[2] || b[3] < pbb[1] || b[1] > pbb[3]) return false;
-    if (it.t !== 's') return pointInPoly(it.cx, it.cy, P);
+    const tol = 4 / this.view.z;
+    if (b[2] < pbb[0] - tol || b[0] > pbb[2] + tol || b[3] < pbb[1] - tol || b[1] > pbb[3] + tol) return false;
+    if (it.t !== 's') return polyTouchesRect(P, b, tol);
     const p = it.pts, n = p.length / 3;
-    let inside = 0, total = 0;
     for (let i = 0; i < n; i++) {
-      total++;
-      if (pointInPoly(p[i * 3], p[i * 3 + 1], P)) inside++;
+      const x = p[i * 3], y = p[i * 3 + 1], r = p[i * 3 + 2] + tol;
+      if (pointNearPoly(x, y, P, r)) return true;
       if (i < n - 1) {
-        total++;
-        if (pointInPoly((p[i * 3] + p[i * 3 + 3]) / 2, (p[i * 3 + 1] + p[i * 3 + 4]) / 2, P)) inside++;
+        const x1 = p[i * 3 + 3], y1 = p[i * 3 + 4], rr = Math.max(r, p[i * 3 + 5] + tol);
+        if (pointInPoly((x + x1) / 2, (y + y1) / 2, P)) return true;
+        for (let j = 0, k = P.length - 2; j < P.length; k = j, j += 2) {
+          if (segmentsCross(x, y, x1, y1, P[k], P[k + 1], P[j], P[j + 1]) || Math.min(
+            pointSegDist2(x, y, P[k], P[k + 1], P[j], P[j + 1]), pointSegDist2(x1, y1, P[k], P[k + 1], P[j], P[j + 1]),
+            pointSegDist2(P[k], P[k + 1], x, y, x1, y1), pointSegDist2(P[j], P[j + 1], x, y, x1, y1)
+          ) <= rr * rr) return true;
+        }
       }
     }
-    return inside * 2 >= total;
+    return false;
   }
 
   // ---------------------------------------------------------------- 選択
-  select(pv, items) {
+  select(pv, items, { includeLocked = false } = {}) {
+    items = items.filter((it) => includeLocked || !it.locked);
+    if (!items.length) return false;
     this.clearSelection();
     const el = h('canvas', { class: 'sel-canvas' });
     this.overWorld.append(el);
@@ -2515,6 +2599,7 @@ export class Engine {
     this.buildSelUi();
     this.updateSelUi();
     this.hooks.onSelection && this.hooks.onSelection(true);
+    return true;
   }
   // 選択したものも、表示倍率ちょうどの解像度・デバイスピクセルに揃えて描く（見えている付近だけ）
   selRegion() {
@@ -2564,6 +2649,9 @@ export class Engine {
     const ui = this.selUi;
     ui.innerHTML = '';
     const box = h('div', { class: 'sel-box' });
+    const isLocked = this.sel.items.length > 0 && this.sel.items.every((it) => it.locked);
+    box.classList.toggle('locked', isLocked);
+    if (isLocked) box.append(h('span', { class: 'sel-lock-badge', html: icon('lock') }));
     for (const c of ['nw', 'ne', 'se', 'sw']) box.append(h('i', { class: 'sel-h ' + c }));
     box.append(h('i', { class: 'sel-rot-line' }), h('i', { class: 'sel-rot' }));
     const menu = h('div', { class: 'sel-menu', 'data-ui': '' });
@@ -2576,15 +2664,17 @@ export class Engine {
       return b;
     };
     const onlyImages = this.sel.items.every((it) => it.t === 'i');
+    const isLocked = this.sel.items.length > 0 && this.sel.items.every((it) => it.locked);
     menu.append(
       ...[
-        onlyImages ? null : btn('palette', '色', (b) => this.hooks.onSelColor && this.hooks.onSelColor(b)),
-        btn('copy', 'コピー', () => this.copySel()),
-        btn('cut', 'カット', () => this.cutSel()),
-        btn('duplicate', '複製', () => this.duplicateSel()),
-        btn('stamp', 'スタンプ', () => this.hooks.onSelStamp && this.hooks.onSelStamp()),
-        btn('more', 'その他', (b) => this.hooks.onSelMore && this.hooks.onSelMore(b)),
-        btn('trash', '削除', () => this.deleteSel(), 'danger'),
+        isLocked ? btn('unlock', 'ロック解除', () => this.toggleSelLock()) : btn('lock', 'ロック', () => this.toggleSelLock()),
+        isLocked ? null : onlyImages ? null : btn('palette', '色', (b) => this.hooks.onSelColor && this.hooks.onSelColor(b)),
+        isLocked ? null : btn('copy', 'コピー', () => this.copySel()),
+        isLocked ? null : btn('cut', 'カット', () => this.cutSel()),
+        isLocked ? null : btn('duplicate', '複製', () => this.duplicateSel()),
+        isLocked ? null : btn('stamp', 'スタンプ', () => this.hooks.onSelStamp && this.hooks.onSelStamp()),
+        isLocked ? null : btn('more', 'その他', (b) => this.hooks.onSelMore && this.hooks.onSelMore(b)),
+        isLocked ? null : btn('trash', '削除', () => this.deleteSel(), 'danger'),
       ].filter(Boolean)
     );
     ui.append(box, menu);
@@ -2601,8 +2691,8 @@ export class Engine {
     return {
       scx: cx * z + tx,
       scy: cy * z + ty,
-      w: (s.bb[2] - s.bb[0]) * z * m.s + 20,
-      h: (s.bb[3] - s.bb[1]) * z * m.s + 20,
+      w: (s.bb[2] - s.bb[0]) * z * m.s + 48,
+      h: (s.bb[3] - s.bb[1]) * z * m.s + 48,
       r: m.r,
     };
   }
@@ -2629,8 +2719,9 @@ export class Engine {
     const c = Math.cos(-g.r), s = Math.sin(-g.r);
     const lx = dx * c - dy * s, ly = dx * s + dy * c;
     const hw = g.w / 2, hh = g.h / 2;
-    const tol = type === 'touch' ? 28 : 20;
-    if (Math.hypot(lx, ly + hh + 30) < tol) return 'rot';
+    if (this.sel.items.length && this.sel.items.every((it) => it.locked)) return null;
+    const tol = type === 'touch' ? 16 : 12;
+    if (Math.hypot(lx, ly + hh + 30) < (type === 'touch' ? 20 : 15)) return 'rot';
     const corners = { nw: [-hw, -hh], ne: [hw, -hh], se: [hw, hh], sw: [-hw, hh] };
     for (const key in corners) if (Math.hypot(lx - corners[key][0], ly - corners[key][1]) < tol) return key;
     if (Math.abs(lx) <= hw + 4 && Math.abs(ly) <= hh + 4) return 'move';
@@ -2694,6 +2785,7 @@ export class Engine {
   }
   commitSel() {
     const s = this.sel, m = s.m, pv = s.pv;
+    if (s.items.some((it) => it.locked)) return;
     const cx = (s.bb[0] + s.bb[2]) / 2, cy = (s.bb[1] + s.bb[3]) / 2;
     let items = s.items.map((it) => transformItem(it, cx, cy, m));
     const dest = this.pageAt({ x: pv.x + cx + m.tx, y: pv.y + cy + m.ty }, 0) || pv;
@@ -2735,9 +2827,26 @@ export class Engine {
     if (this.pvMap.has(s.pv.page)) this.repaintRegion(s.pv, s.bb, 3);
     this.hooks.onSelection && this.hooks.onSelection(false);
   }
+  toggleSelLock() {
+    const s = this.sel;
+    if (!s) return;
+    const locked = !s.items.every((it) => it.locked);
+    const map = new Map(s.items.map((it) => [it, { ...it, locked }]));
+    this.beginEdit(s.pv);
+    s.pv.page.items = s.pv.page.items.map((it) => map.get(it) || it);
+    this.commitEdits();
+    this.markDirty(s.pv.page);
+    s.items = s.items.map((it) => map.get(it));
+    s.bb = unionBB(s.items);
+    s.pv.hidden = new Set(s.items);
+    this.renderSelCanvas();
+    this.buildSelUi();
+    this.updateSelUi();
+  }
   deleteSel() {
     const s = this.sel;
     if (!s) return;
+    if (s.items.some((it) => it.locked)) return;
     this.clearSelection();
     this.removeItems(s.pv, s.items);
   }
@@ -2751,6 +2860,7 @@ export class Engine {
     if (!silent) this.hooks.onToast && this.hooks.onToast('コピーしました');
   }
   cutSel() {
+    if (this.sel && this.sel.items.some((it) => it.locked)) return;
     this.copySel(true);
     this.deleteSel();
     this.hooks.onToast && this.hooks.onToast('カットしました');
@@ -2758,6 +2868,7 @@ export class Engine {
   duplicateSel() {
     const s = this.sel;
     if (!s) return;
+    if (s.items.some((it) => it.locked)) return;
     const pv = s.pv;
     const items = s.items.map((it) => translateItem(cloneItem(it), 24, 24));
     this.clearSelection();
@@ -2771,6 +2882,7 @@ export class Engine {
   recolorSel(color) {
     const s = this.sel;
     if (!s) return;
+    if (s.items.some((it) => it.locked)) return;
     const map = new Map();
     const items = s.items.map((it) => {
       let n = it;
@@ -2792,6 +2904,7 @@ export class Engine {
   arrangeSel(dir) {
     const s = this.sel;
     if (!s) return;
+    if (s.items.some((it) => it.locked)) return;
     const set = new Set(s.items);
     const clones = s.items.map((it) => ({ ...it }));
     this.beginEdit(s.pv);
@@ -2823,8 +2936,8 @@ export class Engine {
   }
   selectAll() {
     const pv = this.pvs[this.currentIndex()];
-    if (!pv || !pv.page.items.length) return;
-    this.select(pv, pv.page.items.slice());
+    if (!pv || !pv.page.items.some((it) => !it.locked)) return;
+    this.select(pv, pv.page.items.filter((it) => !it.locked));
   }
   async paste(at) {
     if (!clipboard.items || !clipboard.items.length) return false;
@@ -2866,12 +2979,12 @@ export class Engine {
     const c = this.toWorld({ x: (A.l + A.r) / 2, y: (A.t + A.b) / 2 });
     return { x: clamp(c.x - pv.x, 60, pv.page.w - 60), y: clamp(c.y - pv.y, 60, pv.page.h - 60) };
   }
-  insertImage(assetId, w, hgt) {
+  insertImage(assetId, w, hgt, name = '') {
     const pv = this.centerPage();
     if (!pv) return;
     const c = this.viewCenterLocal(pv);
     const s = Math.min(1, (pv.page.w * 0.7) / w, (pv.page.h * 0.6) / hgt);
-    const it = { id: uid(), t: 'i', asset: assetId, cx: c.x, cy: c.y, w: w * s, h: hgt * s, r: 0 };
+    const it = { id: uid(), t: 'i', asset: assetId, name, cx: c.x, cy: c.y, w: w * s, h: hgt * s, r: 0 };
     it.bb = itemBounds(it);
     this.finishTransient();
     this.beginEdit(pv);
@@ -2890,7 +3003,7 @@ export class Engine {
     const its = pv.page.items;
     for (let i = its.length - 1; i >= 0; i--) {
       const it = its[i];
-      if (it.t === 'x' && hitBox(it, x, y, 6)) return this.editText(pv, it);
+      if (!it.locked && it.t === 'x' && hitBox(it, x, y, 6)) return this.editText(pv, it);
     }
     this.editText(pv, null, x, y);
   }
