@@ -4,9 +4,9 @@ import { settings, onSettings, ACCENTS } from './settings.js';
 import * as store from './store.js';
 import * as ui from './ui.js';
 import * as exporter from './exporter.js';
-import { Library } from './library.js?v=1.6.12';
-import { Editor, loadAssetEntry } from './editor.js?v=1.6.12';
-import { openSettings, openHelp, maybeWelcome } from './panels.js?v=1.6.12';
+import { Library } from './library.js?v=1.6.13';
+import { Editor, loadAssetEntry } from './editor.js?v=1.6.13';
+import { openSettings, openHelp, maybeWelcome } from './panels.js?v=1.6.13';
 
 const darkMQ = matchMedia('(prefers-color-scheme: dark)');
 // アニメーション終了待ち（画面が非表示だと終わらないことがあるので必ずタイムアウト付き）

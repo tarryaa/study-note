@@ -4,9 +4,9 @@ import { icon } from './icons.js';
 import { settings, saveSettings, ACCENTS, resetSettings } from './settings.js';
 import * as ui from './ui.js';
 import * as store from './store.js';
-import { LOGO } from './library.js?v=1.6.12';
+import { LOGO } from './library.js?v=1.6.13';
 
-export const VERSION = '1.6.12';
+export const VERSION = '1.6.13';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -151,7 +151,7 @@ export function openSettings(app) {
 
 const GESTURES = [
   ['pen', 'Apple Pencil で書く', '筆圧で太さが変わります。指はスクロール・ズーム用（ヘッダーの手のボタンで切替）'],
-  ['sparkle', 'ぐしゃぐしゃっと消す', 'ペンを離さず一筆で、消したい所を何度も往復（ジグザグ・ぐるぐる）すると、触れた線がまるごと消えます。間違えて消えたときは「元に戻す」で戻せます。反応の速さは設定の「消すときの感度」（1〜10）で調整'],
+  ['sparkle', 'ぐしゃぐしゃっと消す', 'ペンを離さず一筆で、消したい所を何度も往復（ジグザグ・ぐるぐる）すると、触れた線と消去線が消えます。「元に戻す」1 回で両方戻り、もう 1 回で消去線だけを取り消せます。反応の速さは設定の「消すときの感度」（1〜10）で調整'],
   ['shapes', '止めると図形に', '直線・弧・曲線・折れ線・円・四角・三角を描いてペンを止めると整います。そのまま動かすと大きさや向きを調整できます。近くにある図形の角・端・辺・円の中心には吸い付きます'],
   ['shapes', '図形ツール', 'ツールバーの図形から、矢印・星・多角形などをドラッグで描けます。塗りや縦横比固定も選べます'],
   ['pages', 'ページは横に並ぶ', '左右に払うとページ移動。拡大中は勢いではページの端で止まり、端からさらに大きく引っ張ると隣のページへ。最後のページでさらに左へ引っ張ると新しいページが追加されます'],

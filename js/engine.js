@@ -2304,7 +2304,8 @@ export class Engine {
   }
   scribbleErase(pv, targets, raw, action) {
     // ぐしゃぐしゃが触れた線は、一部だけでなく線全体を消す
-    // 消去線を先に独立した履歴として記録するため、Undo 1 回目は消去だけを戻し、2 回目で線を消す
+    // 消去線を履歴に加えてから、消去対象と一緒に画面から取り除く。
+    // Undo 1 回目で消去線と対象の線が両方戻り、2 回目で消去線だけを取り消せる。
     action.live.finish();
     const pts = action.live.points();
     let gesture = null;
@@ -2318,13 +2319,14 @@ export class Engine {
       this.drawNew(pv, gesture);
       this.markDirty(pv.page);
     }
-    const set = new Set(targets);
+    const removed = gesture ? targets.concat(gesture) : targets;
+    const set = new Set(removed);
     this.beginEdit(pv);
     pv.page.items = pv.page.items.filter((it) => !set.has(it));
     this.commitEdits();
-    this.repaintRegion(pv, unionBB(gesture ? targets.concat(gesture) : targets), 3);
+    this.repaintRegion(pv, unionBB(removed), 3);
     this.markDirty(pv.page);
-    this.dissolve(pv, targets, raw, null, null);
+    this.dissolve(pv, removed, raw, null, null);
   }
 
   // ---------------------------------------------------------------- 図形ツール
