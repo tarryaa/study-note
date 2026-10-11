@@ -27,11 +27,14 @@ function applyTheme() {
 
 class App {
   async start() {
+    window.__appStartupStage = '設定の読み込み';
     applyTheme();
     onSettings(applyTheme);
     darkMQ.addEventListener ? darkMQ.addEventListener('change', applyTheme) : darkMQ.addListener(applyTheme);
     this.guardGestures();
+    window.__appStartupStage = 'ノート一覧の構築';
     this.library = new Library($('#library'), this);
+    window.__appStartupStage = '編集画面の構築';
     this.editor = new Editor($('#editor'), this);
     this.backupInput = h('input', { type: 'file', hidden: true });
     this.backupInput.addEventListener('change', () => {
@@ -41,6 +44,7 @@ class App {
     });
     document.body.append(this.backupInput);
     try {
+      window.__appStartupStage = '保存データの読み込み';
       await store.loadAll();
     } catch (e) {
       console.error(e);
@@ -52,11 +56,14 @@ class App {
       this.library.root.innerHTML = '';
       this.library.root.append(h('main', { class: 'startup-error' }, h('section', { class: 'startup-error-card' }, h('span', { class: 'startup-error-icon', text: '!' }), h('h1', { text: '保存データを開けません' }), h('p', { text: message }), retry)));
       document.documentElement.classList.add('ready');
+      window.__appStartupStage = '保存データの読み込みエラー画面';
       this.registerSW();
       return;
     }
+    window.__appStartupStage = 'ノート一覧の表示';
     this.library.render(true);
     document.documentElement.classList.add('ready');
+    window.__appStartupStage = '起動完了';
     window.addEventListener('popstate', (e) => this.onPop(e));
     document.addEventListener('keydown', (e) => this.onKey(e));
     document.addEventListener('paste', (e) => this.editor.note && this.editor.onPaste(e));
@@ -72,9 +79,11 @@ class App {
     const m = /#note=([\w-]+)/.exec(location.hash);
     const resume = (m && m[1]) || settings.lastNote;
     history.replaceState({ root: true }, '', location.pathname + location.search);
+    window.__appStartupStage = '前回ノートの復元';
     const n = resume && store.getNote(resume);
     if (n && !n.deletedAt) await this.openNote(n.id, null, { instant: true });
     else maybeWelcome();
+    window.__appStartupStage = '起動完了';
   }
 
   guardGestures() {
@@ -332,4 +341,8 @@ class App {
 
 const app = new App();
 window.__app = app;
-app.start();
+app.start().catch((error) => {
+  console.error('App startup failed', error);
+  window.dispatchEvent(new CustomEvent('bn-startup-error', { detail: error }));
+});
+
