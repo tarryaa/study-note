@@ -5,7 +5,7 @@ import * as store from './store.js';
 import * as ui from './ui.js';
 import * as exporter from './exporter.js';
 import { Library } from './library.js';
-import { Editor, loadAssetEntry } from './editor.js';
+import { Editor, loadAssetEntry } from './editor.js?v=1.6.7';
 import { openSettings, openHelp, maybeWelcome } from './panels.js';
 
 const darkMQ = matchMedia('(prefers-color-scheme: dark)');

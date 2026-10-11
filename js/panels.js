@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.6.6';
+export const VERSION = '1.6.7';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
