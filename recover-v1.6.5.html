@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f4f3ef">
+  <title>勉強ノートの修復</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 24px; color: #202027; background: #f4f3ef; font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(440px, 100%); padding: 30px; border: 1px solid #e9e7e1; border-radius: 26px; background: #fff; box-shadow: 0 18px 60px #24242114; text-align: center; }
+    .mark { width: 56px; height: 56px; display: grid; place-items: center; margin: 0 auto 18px; border-radius: 19px; color: #fff; background: linear-gradient(145deg, #7481f4, #5362dd); font-size: 27px; font-weight: 750; }
+    h1 { margin: 0 0 10px; font-size: 23px; letter-spacing: -.03em; }
+    p { margin: 0 0 20px; color: #686873; }
+    #status { min-height: 28px; margin: 0 0 20px; color: #4f5fe0; font-weight: 650; }
+    a { display: inline-flex; min-height: 48px; align-items: center; justify-content: center; padding: 0 22px; border-radius: 15px; color: #fff; background: #5b6cf0; font-weight: 700; text-decoration: none; }
+    small { display: block; margin-top: 18px; color: #85858c; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark" aria-hidden="true">ノ</div>
+    <h1>勉強ノートを修復</h1>
+    <p>アプリの古いキャッシュだけを整理します。ノートや設定の保存データは削除しません。</p>
+    <div id="status" role="status" aria-live="polite">準備しています…</div>
+    <a id="open" href="./index.html">ノートを開く</a>
+    <small>PDF 用の補助データは、PDF を開いたときに読み込みます。</small>
+  </main>
+  <script>
+    (async () => {
+      const status = document.getElementById('status');
+      const link = document.getElementById('open');
+      const go = () => location.replace('./index.html?repair=' + Date.now());
+      link.addEventListener('click', (event) => { event.preventDefault(); go(); });
+      try {
+        status.textContent = '古いアプリ用キャッシュを整理しています…';
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.filter((key) => key.startsWith('benkyo-note-')).map((key) => caches.delete(key)));
+        }
+        if ('serviceWorker' in navigator) {
+          const appPath = new URL('./', location.href).pathname;
+          const registrations = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(registrations.filter((reg) => new URL(reg.scope).pathname.startsWith(appPath)).map((reg) => reg.unregister()));
+        }
+        status.textContent = '準備できました。ノートを開いています…';
+      } catch (error) {
+        status.textContent = '整理を完了できませんでした。下のボタンからノートを開いてください。';
+      }
+      setTimeout(go, 350);
+    })();
+  </script>
+</body>
+</html>
+
