@@ -458,12 +458,14 @@ html.ready #app { opacity: 1; }
 .sel-rot-line { position: absolute; left: 50%; top: -20px; width: 1.5px; height: 20px; margin-left: -0.75px; background: var(--accent); }
 .sel-menu {
   position: absolute; left: 0; top: 0; display: flex; gap: 2px; padding: 5px; border-radius: 17px; pointer-events: auto;
+  max-width: calc(100vw - 16px); overflow-x: auto; scrollbar-width: none;
   background: var(--pop-bg); box-shadow: var(--shadow-3), 0 0 0 0.5px var(--line-2);
   -webkit-backdrop-filter: blur(26px) saturate(1.8); backdrop-filter: blur(26px) saturate(1.8);
   transition: opacity 0.2s; animation: menuIn 0.4s var(--spring);
 }
+.sel-menu::-webkit-scrollbar { display: none; }
 .sel-ui.dragging .sel-menu { opacity: 0; pointer-events: none; }
-.sel-btn { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 54px; padding: 7px 8px 6px; border-radius: 12px; font-size: 11px; font-weight: 600; color: var(--text); transition: background 0.2s, transform 0.25s var(--spring); }
+.sel-btn { display: flex; flex: 0 0 auto; flex-direction: column; align-items: center; gap: 3px; min-width: 54px; padding: 7px 8px 6px; border-radius: 12px; font-size: 11px; font-weight: 600; color: var(--text); transition: background 0.2s, transform 0.25s var(--spring); }
 .sel-btn .ic { width: 21px; height: 21px; }
 .sel-btn:active { background: var(--hover); transform: scale(0.92); }
 .sel-btn.danger { color: var(--danger); }
@@ -842,3 +844,4 @@ body.editing.dock-bottom .toasts { bottom: calc(var(--sab) + 96px); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-delay: 0ms !important; transition-duration: 0.01ms !important; }
 }
+

@@ -73,7 +73,14 @@ function serializeItem(it) {
   const o = { ...it };
   if (it.pts) o.pts = Array.from(it.pts, (v) => Math.round(v * 100) / 100);
   if (it.bb) o.bb = it.bb.map((v) => Math.round(v * 100) / 100);
+  if (it.t === 'g') o.items = (it.items || []).map(serializeItem);
   return o;
+}
+
+function hydrateItem(it) {
+  if (it.pts) it.pts = Float32Array.from(Array.isArray(it.pts) ? it.pts : Object.values(it.pts));
+  if (it.t === 'g') it.items = (it.items || []).map(hydrateItem);
+  return it;
 }
 
 async function gzip(str) {
@@ -135,7 +142,7 @@ export async function importBackup(file) {
     ops.push({ store: 'notes', put: n });
   }
   for (const p of data.pages || []) {
-    for (const it of p.items || []) if (it.pts) it.pts = Float32Array.from(it.pts);
+    p.items = (p.items || []).map(hydrateItem);
     ops.push({ store: 'pages', put: p });
   }
   for (const a of data.assets || []) {
@@ -146,7 +153,7 @@ export async function importBackup(file) {
   }
   for (const s of data.stamps || []) {
     const rec = { ...s };
-    rec.items = (s.items || []).map((it) => (it.pts ? { ...it, pts: Float32Array.from(it.pts) } : it));
+    rec.items = (s.items || []).map(hydrateItem);
     rec.thumb = s.thumb ? await dataURLToBlob(s.thumb) : null;
     rec.assets = [];
     for (const a of s.assets || []) {
@@ -162,3 +169,4 @@ export async function importBackup(file) {
   store.notifyNotes();
   return { notes: (data.notes || []).length, folders: (data.folders || []).length };
 }
+

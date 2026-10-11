@@ -226,7 +226,9 @@ function fillPath(it) {
 
 // k = 描画の倍率（デバイスピクセル / ページ座標）。拡大時は線を滑らかに補間したパスを使う
 export function drawItem(ctx, it, dark, assets, k = 2) {
-  if (it.t === 's') {
+  if (it.t === 'g') {
+    for (const child of it.items || []) drawItem(ctx, child, dark, assets, k);
+  } else if (it.t === 's') {
     if (it.f) {
       // 図形ツールの塗りつぶし
       ctx.save();
@@ -302,6 +304,7 @@ export function renderRegion(ctx, page, r, scale, opts = {}) {
 }
 
 export function itemBounds(it) {
+  if (it.t === 'g') return it.bb;
   if (it.t === 's') return computeBB(it.pts);
   const c = Math.abs(Math.cos(it.r || 0)), s = Math.abs(Math.sin(it.r || 0));
   const ex = (c * it.w + s * it.h) / 2, ey = (s * it.w + c * it.h) / 2;
@@ -310,6 +313,7 @@ export function itemBounds(it) {
 
 // 回転した矩形（画像・テキスト）に点が含まれるか
 export function hitBox(it, x, y, pad = 0) {
+  if (it.t === 'g') return x >= it.bb[0] - pad && x <= it.bb[2] + pad && y >= it.bb[1] - pad && y <= it.bb[3] + pad;
   const dx = x - it.cx, dy = y - it.cy;
   const c = Math.cos(-(it.r || 0)), s = Math.sin(-(it.r || 0));
   const lx = dx * c - dy * s, ly = dx * s + dy * c;
@@ -325,3 +329,4 @@ export function renderThumb(page, width, assets) {
   renderPageTo(ctx, page, cv.width / page.w, cv.height / page.h, { assets });
   return cv;
 }
+

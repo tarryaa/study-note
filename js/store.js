@@ -226,8 +226,14 @@ export function cloneItem(it, assetMap) {
   const o = { ...it, id: uid() };
   if (it.pts) o.pts = new Float32Array(it.pts);
   if (it.bb) o.bb = it.bb.slice();
+  if (it.t === 'g') o.items = (it.items || []).map((child) => cloneItem(child, assetMap));
   if (it.asset && assetMap && assetMap.has(it.asset)) o.asset = assetMap.get(it.asset);
   return o;
+}
+
+export function visitItemTree(it, fn) {
+  fn(it);
+  if (it.t === 'g') for (const child of it.items || []) visitItemTree(child, fn);
 }
 
 export async function duplicateNote(id) {
@@ -320,3 +326,4 @@ export async function loadStampFolders() {
 }
 export const saveStampFolder = (folder) => db.put('stampFolders', folder);
 export const deleteStampFolder = (id) => db.del('stampFolders', id);
+

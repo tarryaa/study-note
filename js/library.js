@@ -6,7 +6,7 @@ import * as store from './store.js';
 import * as ui from './ui.js';
 import { templateGrid, paperSwatches, sizeChips, coverSwatches, folderSwatches } from './pickers.js';
 import { renderThumb } from './render.js';
-import { imagesToPageSpecs, loadAssetEntry } from './editor.js?v=1.6.10';
+import { imagesToPageSpecs, loadAssetEntry } from './editor.js?v=1.6.11';
 
 const SORTS = [
   { id: 'updated', label: '更新日が新しい順' },
@@ -1011,3 +1011,4 @@ export class Library {
     });
   }
 }
+

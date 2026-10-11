@@ -19,7 +19,7 @@ import {
 import { detectScribble } from './scribble.js';
 import { recognizeShape, snapLineEnd, shapeGeometry } from './shapes.js';
 import { renderPageTo, renderRegion, drawItem, itemBounds, hitBox, textHeight, LINE_H } from './render.js';
-import { newPageData, cloneItem } from './store.js';
+import { newPageData, cloneItem, visitItemTree } from './store.js';
 
 const GAP = 72; // ページ同士の間隔（横並び）
 export const MAX_Z = 10;
@@ -117,6 +117,10 @@ export function transformItem(it, cx, cy, m) {
   const cos = Math.cos(m.r), sin = Math.sin(m.r), s = m.s;
   const fx = (x, y) => cx + m.tx + (x - cx) * s * cos - (y - cy) * s * sin;
   const fy = (x, y) => cy + m.ty + (x - cx) * s * sin + (y - cy) * s * cos;
+  if (it.t === 'g') {
+    const children = it.items.map((child) => transformItem(child, cx, cy, m));
+    return { ...it, items: children, bb: unionBB(children) };
+  }
   if (it.t === 's') {
     const src = it.pts, p = new Float32Array(src.length);
     for (let i = 0; i < src.length; i += 3) {
@@ -132,6 +136,25 @@ export function transformItem(it, cx, cy, m) {
   return o;
 }
 export const translateItem = (it, dx, dy) => transformItem(it, 0, 0, { tx: dx, ty: dy, s: 1, r: 0 });
+
+function strokeItems(it) {
+  const out = [];
+  visitItemTree(it, (child) => { if (child.t === 's') out.push(child); });
+  return out;
+}
+function strokeHitSegment(it, ax, ay, bx, by, radius) {
+  if (it.t === 's') return hitStrokeSegment(it, ax, ay, bx, by, radius);
+  return it.t === 'g' && (it.items || []).some((child) => strokeHitSegment(child, ax, ay, bx, by, radius));
+}
+function strokeHitCircle(it, x, y, radius, hlOnly = false) {
+  if (it.t === 's') return (!hlOnly || it.k === 'hl') && hitStrokeCircle(it, x, y, radius);
+  return it.t === 'g' && (it.items || []).some((child) => strokeHitCircle(child, x, y, radius, hlOnly));
+}
+function recolorItem(it, color) {
+  if (it.t === 'g') return { ...it, items: it.items.map((child) => recolorItem(child, color)) };
+  if (it.t === 's' || it.t === 'x') return { ...it, c: color, ...(it.f ? { f: color } : {}) };
+  return it;
+}
 
 export class Engine {
   constructor(stage, hooks = {}) {
@@ -1074,9 +1097,9 @@ export class Engine {
   }
   assetLoaded(id) {
     for (const pv of this.pvs) {
-      if (pv.page.bg === id || pv.page.items.some((it) => it.t === 'i' && it.asset === id)) this.invalidatePage(pv);
+      if (pv.page.bg === id || pv.page.items.some((it) => { let found = false; visitItemTree(it, (child) => { if (child.t === 'i' && child.asset === id) found = true; }); return found; })) this.invalidatePage(pv);
     }
-    if (this.sel && this.sel.items.some((it) => it.asset === id)) this.renderSelCanvas();
+    if (this.sel && this.sel.items.some((it) => { let found = false; visitItemTree(it, (child) => { if (child.t === 'i' && child.asset === id) found = true; }); return found; })) this.renderSelCanvas();
   }
 
   // ---- 予備の縮小版（重いページを素早くズームアウトしたとき、描き直すまでの間だけ見える）
@@ -2140,11 +2163,9 @@ export class Engine {
       const ax = raw[(i - 1) * 4], ay = raw[(i - 1) * 4 + 1], bx = raw[i * 4], by = raw[i * 4 + 1];
       for (let k = 0; k < items.length; k++) {
         const it = items[k];
-        if (it.t !== 's' || a.targets.has(it)) continue;
-        if (hitStrokeSegment(it, ax, ay, bx, by, R)) {
-          a.targets.add(it);
-          newly.push(it);
-        }
+        if (a.targets.has(it) || !strokeHitSegment(it, ax, ay, bx, by, R)) continue;
+        a.targets.add(it);
+        newly.push(it);
       }
     }
     a.scrTested = n;
@@ -2165,7 +2186,7 @@ export class Engine {
     ctx.beginPath();
     ctx.rect(0, 0, pv.page.w, pv.page.h);
     ctx.clip();
-    for (const it of a.targets) {
+    for (const target of a.targets) for (const it of strokeItems(target)) {
       if (it.k === 'hl') {
         ctx.strokeStyle = 'rgba(255,72,60,0.45)';
         ctx.lineWidth = it.w;
@@ -2176,7 +2197,9 @@ export class Engine {
         ctx.fillStyle = 'rgba(255,72,60,0.92)';
         ctx.fill(itemPath(it, k));
       }
-      this.markFx(pv, it.bb, 4);
+    }
+    for (const target of a.targets) {
+      this.markFx(pv, target.bb, 4);
     }
     ctx.restore();
   }
@@ -2210,7 +2233,7 @@ export class Engine {
       const targets = [...a.targets];
       this.clearInk();
       this.resetInkStyle();
-      this.scribbleErase(pv, targets, a.live.raw);
+      this.scribbleErase(pv, targets, a.live.raw, a);
       return;
     }
     this.clearFx();
@@ -2243,13 +2266,27 @@ export class Engine {
     this.resetInkStyle();
     this.markDirty(pv.page);
   }
-  scribbleErase(pv, targets, raw) {
+  scribbleErase(pv, targets, raw, action) {
     // ぐしゃぐしゃが触れた線は、一部だけでなく線全体を消す
+    // 消去線を先に独立した履歴として記録するため、Undo 1 回目は消去だけを戻し、2 回目で線を消す
+    action.live.finish();
+    const pts = action.live.points();
+    let gesture = null;
+    if (pts && pts.length) {
+      gesture = { id: uid(), t: 's', k: 'pen', c: action.o.color, w: action.o.w, pts: Float32Array.from(pts) };
+      gesture.bb = computeBB(gesture.pts);
+      if (action.live.count > 1) setItemPath(gesture, action.live.fullPath(), this.view.z * this.dpr);
+      this.beginEdit(pv);
+      pv.page.items.push(gesture);
+      this.commitEdits();
+      this.drawNew(pv, gesture);
+      this.markDirty(pv.page);
+    }
     const set = new Set(targets);
     this.beginEdit(pv);
     pv.page.items = pv.page.items.filter((it) => !set.has(it));
     this.commitEdits();
-    this.repaintRegion(pv, unionBB(targets), 3);
+    this.repaintRegion(pv, unionBB(gesture ? targets.concat(gesture) : targets), 3);
     this.markDirty(pv.page);
     this.dissolve(pv, targets, raw, null, null);
   }
@@ -2433,9 +2470,8 @@ export class Engine {
     const items = pv.page.items;
     for (let i = items.length - 1; i >= 0; i--) {
       const it = items[i];
-      if (it.locked || it.t !== 's' || (T.hlOnly && it.k !== 'hl')) continue;
-      if (!hitStrokeCircle(it, x, y, R)) continue;
-      if (T.mode === 'stroke') {
+      if (it.locked || (it.t !== 's' && it.t !== 'g') || !strokeHitCircle(it, x, y, R, T.hlOnly)) continue;
+      if (T.mode === 'stroke' || it.t === 'g') {
         this.beginEdit(pv);
         items.splice(i, 1);
       } else {
@@ -2663,7 +2699,11 @@ export class Engine {
       });
       return b;
     };
-    const onlyImages = this.sel.items.every((it) => it.t === 'i');
+    const onlyImages = this.sel.items.every((it) => {
+      let imagesOnly = true;
+      visitItemTree(it, (child) => { if (child.t !== 'g' && child.t !== 'i') imagesOnly = false; });
+      return imagesOnly;
+    });
     menu.append(
       ...[
         isLocked ? btn('unlock', 'ロック解除', () => this.toggleSelLock()) : btn('lock', 'ロック', () => this.toggleSelLock()),
@@ -2671,6 +2711,7 @@ export class Engine {
         isLocked ? null : btn('copy', 'コピー', () => this.copySel()),
         isLocked ? null : btn('cut', 'カット', () => this.cutSel()),
         isLocked ? null : btn('duplicate', '複製', () => this.duplicateSel()),
+        isLocked || this.sel.items.length < 2 ? null : btn('layers', '結合', () => this.combineSel()),
         isLocked ? null : btn('stamp', 'スタンプ', () => this.hooks.onSelStamp && this.hooks.onSelStamp()),
         isLocked ? null : btn('more', 'その他', (b) => this.hooks.onSelMore && this.hooks.onSelMore(b)),
         isLocked ? null : btn('trash', '削除', () => this.deleteSel(), 'danger'),
@@ -2849,13 +2890,40 @@ export class Engine {
     this.clearSelection();
     this.removeItems(s.pv, s.items);
   }
+  combineSel() {
+    const s = this.sel;
+    if (!s || s.items.length < 2 || s.items.some((it) => it.locked)) return;
+    const selected = new Set(s.items), pageItems = s.pv.page.items;
+    const indexes = pageItems.map((it, i) => selected.has(it) ? i : -1).filter((i) => i >= 0);
+    if (indexes.length < 2) return;
+    const children = pageItems.filter((it) => selected.has(it));
+    const group = { id: uid(), t: 'g', items: children, bb: unionBB(children) };
+    const first = indexes[0];
+    this.beginEdit(s.pv);
+    const next = [];
+    pageItems.forEach((it, i) => {
+      if (i === first) next.push(group);
+      if (!selected.has(it)) next.push(it);
+    });
+    s.pv.page.items = next;
+    this.commitEdits();
+    this.markDirty(s.pv.page);
+    s.items = [group];
+    s.bb = group.bb.slice();
+    s.m = { tx: 0, ty: 0, s: 1, r: 0 };
+    s.pv.hidden = new Set(s.items);
+    this.renderSelCanvas();
+    this.buildSelUi();
+    this.updateSelUi();
+    this.hooks.onToast && this.hooks.onToast('1つのオブジェクトに結合しました');
+  }
   copySel(silent) {
     const s = this.sel;
     if (!s) return;
     clipboard.items = s.items.map((it) => cloneItem(it));
     clipboard.bb = s.bb.slice();
     clipboard.assets = new Map();
-    for (const it of s.items) if (it.t === 'i') clipboard.assets.set(it.asset, this.assets.get(it.asset));
+    for (const it of s.items) visitItemTree(it, (child) => { if (child.t === 'i') clipboard.assets.set(child.asset, this.assets.get(child.asset)); });
     if (!silent) this.hooks.onToast && this.hooks.onToast('コピーしました');
   }
   cutSel() {
@@ -2884,11 +2952,7 @@ export class Engine {
     if (s.items.some((it) => it.locked)) return;
     const map = new Map();
     const items = s.items.map((it) => {
-      let n = it;
-      if (it.t === 's' || it.t === 'x') {
-        n = { ...it, c: color };
-        if (it.f) n.f = color;
-      }
+      const n = recolorItem(it, color);
       map.set(it, n);
       return n;
     });
@@ -3365,7 +3429,8 @@ export class Engine {
       vy: (-Math.random() * 0.22 - 0.03) / z,
       r: (0.8 + Math.random() * 1.7) / z,
     });
-    for (const it of items) {
+    const animated = items.flatMap((it) => strokeItems(it));
+    for (const it of animated) {
       if (partial && partial.has(it)) continue;
       const p = it.pts, n = p.length / 3;
       const step = Math.max(1, Math.floor(n / 8));
@@ -3388,7 +3453,7 @@ export class Engine {
       }
       const e = 1 - (1 - t) * (1 - t);
       ctx.setTransform(k, 0, 0, k, ox, oy);
-      for (const it of items) {
+      for (const it of animated) {
         const b = it.bb, cx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2, s = 1 + 0.1 * e;
         ctx.save();
         if (partial && partial.has(it) && hullPath) ctx.clip(hullPath);
@@ -3422,3 +3487,4 @@ export class Engine {
     this.fxAnim = requestAnimationFrame(frame);
   }
 }
+

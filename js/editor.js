@@ -4,7 +4,7 @@ import { icon } from './icons.js';
 import { settings, saveSettings } from './settings.js';
 import * as store from './store.js';
 import * as db from './db.js';
-import { Engine, clipboard, translateItem } from './engine.js?v=1.6.10';
+import { Engine, clipboard, translateItem } from './engine.js?v=1.6.11';
 import * as ui from './ui.js';
 import { renderThumb } from './render.js';
 import { PEN_TYPES, LiveStroke } from './ink.js';
@@ -340,7 +340,7 @@ export class Editor {
       const used = new Set();
       for (const p of this.engine.pages()) {
         if (p.bg) used.add(p.bg);
-        for (const it of p.items) if (it.t === 'i') used.add(it.asset);
+        for (const it of p.items) store.visitItemTree(it, (child) => { if (child.t === 'i') used.add(child.asset); });
       }
       const unused = [...this.engine.assets.keys()].filter((k) => !used.has(k));
       if (unused.length) await store.deleteAssets(unused);
@@ -1326,9 +1326,11 @@ export class Editor {
       const items = s.items.map((it) => translateItem(store.cloneItem(it), -cx, -cy));
       const assets = [];
       for (const it of s.items) {
-        if (it.t !== 'i' || assets.some((a) => a.id === it.asset)) continue;
-        const e = E.assets.get(it.asset);
-        if (e && e.blob) assets.push({ id: it.asset, blob: e.blob, w: e.w, h: e.h, type: e.blob.type });
+        store.visitItemTree(it, (child) => {
+          if (child.t !== 'i' || assets.some((a) => a.id === child.asset)) return;
+          const e = E.assets.get(child.asset);
+          if (e && e.blob) assets.push({ id: child.asset, blob: e.blob, w: e.w, h: e.h, type: e.blob.type });
+        });
       }
       const src = E.selectionCanvas(2, true);
       if (!src) return;
@@ -1674,3 +1676,4 @@ export class Editor {
     return true;
   }
 }
+
