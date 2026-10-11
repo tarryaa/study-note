@@ -6,7 +6,7 @@ import * as ui from './ui.js';
 import * as store from './store.js';
 import { LOGO } from './library.js';
 
-export const VERSION = '1.6.8';
+export const VERSION = '1.6.9';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -208,4 +208,3 @@ export function isIOSBrowser() {
   const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
   return ios && !standalone;
 }
-
