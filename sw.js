@@ -1,10 +1,11 @@
 // Service Worker：オフラインでも起動できるようにアプリ本体をキャッシュ
 // ★ ファイルを更新して GitHub に上げたら、VERSION の数字を上げてください（iPad 側に「更新」が出ます）
-const VERSION = 'v1.6.1';
+const VERSION = 'v1.6.2';
 const CACHE = 'benkyo-note-' + VERSION;
 const ASSETS = [
   './',
   './index.html',
+  './recover.html',
   './manifest.webmanifest',
   './css/app.css',
   './js/app.js',
@@ -249,6 +250,7 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('message', (e) => {
   if (e.data === 'skipWaiting') self.skipWaiting();
+  if (e.data === 'getVersion' && e.ports && e.ports[0]) e.ports[0].postMessage(VERSION);
 });
 
 self.addEventListener('fetch', (e) => {
