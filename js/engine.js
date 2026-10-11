@@ -206,6 +206,7 @@ export class Engine {
     this.tapSess = null;
     this.lastTap = null;
     this.action = null;
+    this.inputEvents = [];
     this.sel = null;
     this.textEdit = null;
     this.edits = null;
@@ -238,27 +239,28 @@ export class Engine {
     st.addEventListener('pointercancel', (e) => this.onUp(e, true));
     st.addEventListener('lostpointercapture', (e) => {
       const a = this.action;
-      if (!a || a.pointerId !== e.pointerId) return;
-      if (e.pointerType === 'touch') this.touchUp(e, false);
-      else this.onUp(e, false);
+      this.logInputEvent('lost-capture', e);
+      if (this.touches.has(e.pointerId)) this.touchUp(e, true);
+      else if (a && a.pointerId === e.pointerId) this.onUp(e, true);
     });
     st.addEventListener('pointerleave', (e) => {
       if (e.pointerType !== 'touch' && !this.action) this.hideCursor();
     });
     const endPointer = (e) => {
-      // stage 内で始まった入力は pointer capture により stage に届くので、そこで一度だけ終了する。
-      if (this.stage.contains(e.target)) return;
+      // Safari が stage まで pointerup を配送し損ねても、document 側で必ず入力を終了する。
+      this.logInputEvent(e.type, e);
       if (e.pointerType === 'touch') {
         // ツールバー上の指は bindOutsideTouches 側で終了させる。
         if (this.outside && this.outside.has(e.pointerId)) return;
         if (this.touches.has(e.pointerId)) this.touchUp(e, e.type === 'pointercancel');
       } else if (this.action && this.action.pointerId === e.pointerId) this.onUp(e, e.type === 'pointercancel');
+      else if (this.mousePan && this.mousePan.id === e.pointerId) this.onUp(e, e.type === 'pointercancel');
     };
     document.addEventListener('pointerup', endPointer, true);
     document.addEventListener('pointercancel', endPointer, true);
-    const recover = () => this.resetInputState();
-    window.addEventListener('blur', recover);
-    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') recover(); });
+    const recover = (reason) => { this.logInputEvent(reason); this.resetInputState(); };
+    window.addEventListener('blur', () => recover('window-blur'));
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') recover('hidden'); });
     const pd = (e) => {
       if (!this.isUi(e.target)) e.preventDefault();
     };
@@ -270,6 +272,15 @@ export class Engine {
     });
     st.addEventListener('dblclick', (e) => e.preventDefault());
     this.bindOutsideTouches();
+  }
+  logInputEvent(type, e = null) {
+    if (!this.inputEvents) this.inputEvents = [];
+    this.inputEvents.push([
+      Math.round(now()), type, e ? e.pointerType : '', e ? e.pointerId : -1,
+      this.action ? this.action.kind : '-', this.touches ? this.touches.size : 0,
+      this.tg ? this.tg.mode : '-', this.mousePan ? 1 : 0,
+    ]);
+    if (this.inputEvents.length > 120) this.inputEvents.shift();
   }
   isUi(t) {
     return !!(t && t.closest && t.closest('button, input, textarea, select, [data-ui]'));
@@ -1254,12 +1265,21 @@ export class Engine {
   onDown(e) {
     if (!this.loaded || this.isUi(e.target)) return;
     const type = e.pointerType;
+    this.logInputEvent('down', e);
     if (type === 'touch') return this.touchDown(e);
     if (type === 'pen') this.notePen();
     if (type === 'mouse' && e.button !== 0) {
       if (e.button === 1 || e.button === 2) this.beginMousePan(e);
       return;
     }
+    // 新しいペン入力が来た時に指側の終了通知が抜けていたら、残った操作状態を解放する。
+    // 指で描画・選択中でもペンを優先し、前のストロークは確定してから続ける。
+    if (type === 'pen' && this.action && this.action.pointerType !== 'pen') {
+      const stale = this.action;
+      if (stale.kind === 'stroke') this.endAction(stale, null, false);
+      else this.cancelAction();
+    }
+    if (type === 'pen' && (this.touches.size || this.tg || this.tapSess || this.mousePan)) this.resetInputState();
     // ペンが新しく画面に触れた＝前の線は確実に終わっている（ペンを離した通知を取りこぼしても、
     // 2 本の線が 1 本につながって判定されることがないように、ここで前の線を確定させる）
     const prev = this.action;
@@ -1356,6 +1376,8 @@ export class Engine {
     } else this.logTouch(e, 'ok');
     const sp = this.sp(e);
     this.touches.set(e.pointerId, { id: e.pointerId, x: sp.x, y: sp.y, sx: sp.x, sy: sp.y });
+    // パン・ピンチ中も stage が pointerup / pointercancel を受け取るようにする。
+    try { this.stage.setPointerCapture(e.pointerId); } catch (_) {}
     if (!this.tapSess) this.tapSess = { t0: now(), max: 0, moved: false, drew: false, sp, from: this.focusIndex() };
     this.tapSess.max = Math.max(this.tapSess.max, this.touches.size);
     this.stopAnim();
@@ -1756,6 +1778,11 @@ export class Engine {
   }
   moveStroke(a, e) {
     const evs = coalesced(e);
+    const last = evs[evs.length - 1];
+    const sig = `${e.pointerId}:${e.timeStamp}:${e.clientX}:${e.clientY}:${last.timeStamp}:${last.clientX}:${last.clientY}:${evs.length}`;
+    // 一部の Safari で同じ pointermove が連続して届く。重複描画・予測・消し判定を省く。
+    if (sig === a.lastMoveSig) return;
+    a.lastMoveSig = sig;
     // ペンを離した通知が届かずに次の線を書き始めた場合（間が空いて、離れた場所から急に続く）は、
     // 前の線をそこで確定して新しい線として書き始める（2 本の線が 1 本につながらないように）
     // （判定には信頼できる本体のイベントの時刻と位置だけを使う）
@@ -2212,7 +2239,16 @@ export class Engine {
     if (this.inputLog.length > 3) this.inputLog.shift();
   }
   inputLogText() {
-    return JSON.stringify({ ua: navigator.userAgent, dpr: this.dpr, strokes: this.inputLog || [], touches: this.touchLog || [] });
+    return JSON.stringify({
+      ua: navigator.userAgent, dpr: this.dpr,
+      state: {
+        loaded: this.loaded, visible: document.visibilityState,
+        action: this.action ? { kind: this.action.kind, pointerId: this.action.pointerId, pointerType: this.action.pointerType } : null,
+        touches: [...this.touches.keys()], gesture: this.tg ? this.tg.mode : null,
+        outside: this.outside ? [...this.outside.keys()] : [], mousePan: this.mousePan ? this.mousePan.id : null,
+      },
+      strokes: this.inputLog || [], touches: this.touchLog || [], inputEvents: this.inputEvents || [],
+    });
   }
   endStroke(a) {
     clearTimeout(a.holdT);

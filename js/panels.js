@@ -4,9 +4,9 @@ import { icon } from './icons.js';
 import { settings, saveSettings, ACCENTS, resetSettings } from './settings.js';
 import * as ui from './ui.js';
 import * as store from './store.js';
-import { LOGO } from './library.js?v=1.6.11';
+import { LOGO } from './library.js?v=1.6.12';
 
-export const VERSION = '1.6.11';
+export const VERSION = '1.6.12';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';

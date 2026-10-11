@@ -4,7 +4,7 @@ import { icon } from './icons.js';
 import { settings, saveSettings } from './settings.js';
 import * as store from './store.js';
 import * as db from './db.js';
-import { Engine, clipboard, translateItem } from './engine.js?v=1.6.11';
+import { Engine, clipboard, translateItem } from './engine.js?v=1.6.12';
 import * as ui from './ui.js';
 import { renderThumb } from './render.js';
 import { PEN_TYPES, LiveStroke } from './ink.js';
