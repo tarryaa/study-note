@@ -44,7 +44,16 @@ class App {
       await store.loadAll();
     } catch (e) {
       console.error(e);
-      ui.toast('データを読み込めませんでした。プライベートブラウズでは保存できません', { duration: 8000 });
+      const retry = h('button', { class: 'btn primary', text: '再読み込み' });
+      retry.addEventListener('click', () => location.reload());
+      const message = e && e.name === 'DatabaseBlockedError'
+        ? '別のタブやホーム画面アプリが古い版を開いたままのため、保存データを更新できません。ほかで開いている勉強ノートを閉じてから再読み込みしてください。ノートは削除されていません。'
+        : 'ブラウザの保存データを開けませんでした。Safariを再起動して、もう一度お試しください。';
+      this.library.root.innerHTML = '';
+      this.library.root.append(h('main', { class: 'startup-error' }, h('section', { class: 'startup-error-card' }, h('span', { class: 'startup-error-icon', text: '!' }), h('h1', { text: '保存データを開けません' }), h('p', { text: message }), retry)));
+      document.documentElement.classList.add('ready');
+      this.registerSW();
+      return;
     }
     this.library.render(true);
     document.documentElement.classList.add('ready');

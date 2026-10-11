@@ -1,11 +1,21 @@
-// PDF.js is vendored so importing PDFs also works offline after the app update.
-import * as pdfjs from './vendor/pdfjs/pdf.min.mjs';
-
-pdfjs.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
-
+// PDF.js is vendored and loaded on demand so it cannot block the app's startup.
 const cmapUrl = new URL('./vendor/pdfjs/cmaps/', import.meta.url).href;
 const fontUrl = new URL('./vendor/pdfjs/standard_fonts/', import.meta.url).href;
 const wasmUrl = new URL('./vendor/pdfjs/wasm/', import.meta.url).href;
+let pdfjsPromise;
+
+function loadPdfJs() {
+  if (!pdfjsPromise) {
+    pdfjsPromise = import('./vendor/pdfjs/pdf.min.mjs').then((pdfjs) => {
+      pdfjs.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
+      return pdfjs;
+    }).catch((error) => {
+      pdfjsPromise = null;
+      throw error;
+    });
+  }
+  return pdfjsPromise;
+}
 
 export function isPdfFile(file) {
   return !!file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name || ''));
@@ -17,6 +27,7 @@ function toBlob(canvas) {
 
 // Render each page at up to 300 dpi (or 10 megapixels) before placing it in a note.
 export async function renderPdfPages(file, { firstOnly = false } = {}) {
+  const pdfjs = await loadPdfJs();
   const data = new Uint8Array(await file.arrayBuffer());
   const task = pdfjs.getDocument({ data, cMapUrl, cMapPacked: true, standardFontDataUrl: fontUrl, wasmUrl, useSystemFonts: true });
   const doc = await task.promise;

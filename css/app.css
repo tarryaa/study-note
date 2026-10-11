@@ -81,6 +81,11 @@ img { -webkit-user-drag: none; }
 .muted { color: var(--text-3); }
 #app { position: fixed; inset: 0; opacity: 0; transition: opacity 0.4s var(--ease); }
 html.ready #app { opacity: 1; }
+.startup-error { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; padding: 24px; background: var(--bg); }
+.startup-error-card { width: min(440px, 100%); padding: 28px; border-radius: 24px; background: var(--surface); box-shadow: var(--shadow-3); text-align: center; }
+.startup-error-icon { width: 46px; height: 46px; display: grid; place-items: center; margin: 0 auto 14px; border-radius: 50%; background: rgba(var(--accent-rgb), 0.12); color: var(--accent); font-size: 25px; font-weight: 800; }
+.startup-error-card h1 { margin: 0 0 10px; font-size: 20px; }
+.startup-error-card p { margin: 0 0 20px; color: var(--text-2); font-size: 14px; line-height: 1.65; }
 .view { position: absolute; inset: 0; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 4px; }

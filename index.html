@@ -31,7 +31,34 @@
     <div id="editor" class="view" hidden></div>
   </div>
   <div id="overlay-root"></div>
+  <div id="boot-fallback" hidden style="position:fixed;inset:0;z-index:10000;place-items:center;padding:24px;background:#f4f3ef;color:#1c1c1f;font:16px/1.6 -apple-system,BlinkMacSystemFont,sans-serif">
+    <section style="width:min(440px,100%);padding:28px;border-radius:24px;background:#fff;box-shadow:0 16px 48px #0002;text-align:center">
+      <h1 style="margin:0 0 12px;font-size:22px">アプリを起動できません</h1>
+      <p style="margin:0 0 20px;color:#64646c">読み込みが止まったか、保存データの更新が別のタブを待っています。ほかで勉強ノートを開いている場合は閉じて、再読み込みしてください。ノートのデータはこの表示によって削除されません。</p>
+      <button id="boot-reload" style="border:0;border-radius:14px;padding:12px 22px;background:#5b6cf0;color:#fff;font:600 15px -apple-system,BlinkMacSystemFont,sans-serif">再読み込み</button>
+    </section>
+  </div>
   <noscript>このアプリを使うには JavaScript を有効にしてください。</noscript>
   <script type="module" src="js/app.js"></script>
+  <script>
+    (() => {
+      const root = document.documentElement;
+      const fallback = document.getElementById('boot-fallback');
+      document.getElementById('boot-reload').addEventListener('click', () => location.reload());
+      const observer = new MutationObserver(() => {
+        if (root.classList.contains('ready')) {
+          fallback.hidden = true;
+          observer.disconnect();
+        }
+      });
+      observer.observe(root, { attributes: true, attributeFilter: ['class'] });
+      setTimeout(() => {
+        if (!root.classList.contains('ready')) {
+          fallback.hidden = false;
+          fallback.style.display = 'grid';
+        }
+      }, 12000);
+    })();
+  </script>
 </body>
 </html>

@@ -8,6 +8,7 @@ function open() {
   if (_db) return Promise.resolve(_db);
   if (_opening) return _opening;
   _opening = new Promise((resolve, reject) => {
+    let blockedTimer = 0, blocked = false;
     const req = indexedDB.open(NAME, VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -20,14 +21,25 @@ function open() {
       if (!db.objectStoreNames.contains('stampFolders')) db.createObjectStore('stampFolders', { keyPath: 'id' });
     };
     req.onsuccess = () => {
+      clearTimeout(blockedTimer);
       _db = req.result;
       _db.onclose = () => { _db = null; };
       _db.onversionchange = () => { try { _db.close(); } catch (_) {} _db = null; };
       _opening = null;
       resolve(_db);
     };
-    req.onerror = () => { _opening = null; reject(req.error); };
-    req.onblocked = () => {};
+    req.onerror = () => { clearTimeout(blockedTimer); _opening = null; reject(req.error); };
+    req.onblocked = () => {
+      if (blocked) return;
+      blocked = true;
+      blockedTimer = setTimeout(() => {
+        blockedTimer = 0;
+        _opening = null;
+        const error = new Error('Close other note app tabs and reload to finish the database update.');
+        error.name = 'DatabaseBlockedError';
+        reject(error);
+      }, 8000);
+    };
   });
   return _opening;
 }
