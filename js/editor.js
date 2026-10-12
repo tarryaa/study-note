@@ -4,7 +4,7 @@ import { icon } from './icons.js';
 import { settings, saveSettings } from './settings.js';
 import * as store from './store.js';
 import * as db from './db.js';
-import { Engine, clipboard, translateItem } from './engine.js?v=1.6.13';
+import { Engine, clipboard, translateItem } from './engine.js?v=1.6.14';
 import * as ui from './ui.js';
 import { renderThumb } from './render.js';
 import { PEN_TYPES, LiveStroke } from './ink.js';
@@ -220,6 +220,7 @@ export class Editor {
     r.append(this.stage, this.head, this.dockWrap, this.pageNav, this.zoomInd, this.fileInput);
 
     this.engine = new Engine(this.stage, {
+      getDiagnosticContext: () => ({ editorOpen: !!this.note, editorVisible: !this.root.hidden, libraryVisible: !this.app.library.root.hidden, noteId: this.note && this.note.id || null, appBusy: !!this.app.busy }),
       onHistory: () => this.updateUndo(),
       onView: () => this.onView(),
       onZoom: (z) => this.showZoom(z),
@@ -351,6 +352,7 @@ export class Editor {
     this.note = null;
     this.root.hidden = true;
     document.body.classList.remove('editing');
+    this.engine.persistDiagnostics('editor-close-complete');
     settings.lastNote = null;
     saveSettings();
     store.notifyNotes();

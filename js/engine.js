@@ -30,6 +30,7 @@ const HOLD_MS = 420; // 図形補正までの長押し時間
 const LIVE_CHUNK = 160; // 書いている線の、毎回描き直す部分の最大の点数
 const PULL = 120; // 最後のページで横に引っ張ってページを追加するまでの距離
 const now = () => performance.now();
+const DIAG_STORAGE_KEY = 'bn.input-diagnostics.v1';
 // 図形補正のうち角のあるもの（線を滑らかに補間しない）
 const SHARP_KINDS = new Set(['line', 'polyline', 'rect', 'triangle', 'polygon']);
 
@@ -207,6 +208,17 @@ export class Engine {
     this.lastTap = null;
     this.action = null;
     this.inputEvents = [];
+    this.healthLog = [];
+    this.runtimeErrors = [];
+    this.previousDiagnostics = null;
+    try {
+      const saved = localStorage.getItem(DIAG_STORAGE_KEY);
+      if (saved) this.previousDiagnostics = JSON.parse(saved);
+    } catch (_) {}
+    this.diagLastAt = now();
+    this.diagWasVisible = document.visibilityState === 'visible';
+    this.diagTimer = setInterval(() => this.sampleDiagnostics(), 2000);
+    window.addEventListener('pagehide', () => this.persistDiagnostics('pagehide'));
     this.sel = null;
     this.textEdit = null;
     this.edits = null;
@@ -261,6 +273,8 @@ export class Engine {
     const recover = (reason) => { this.logInputEvent(reason); this.resetInputState(); };
     window.addEventListener('blur', () => recover('window-blur'));
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') recover('hidden'); });
+    window.addEventListener('error', (e) => this.logRuntimeError('error', e.error || e.message));
+    window.addEventListener('unhandledrejection', (e) => this.logRuntimeError('unhandledrejection', e.reason));
     const pd = (e) => {
       if (!this.isUi(e.target)) e.preventDefault();
     };
@@ -272,6 +286,47 @@ export class Engine {
     });
     st.addEventListener('dblclick', (e) => e.preventDefault());
     this.bindOutsideTouches();
+  }
+  diagnosticState() {
+    let context = {};
+    try { context = this.hooks.getDiagnosticContext ? this.hooks.getDiagnosticContext() : {}; } catch (_) {}
+    return {
+      context,
+      loaded: this.loaded, visible: document.visibilityState,
+      noteId: this.note && this.note.id || null, pageCount: this.pvs.length, tool: this.tool,
+      action: this.action ? { kind: this.action.kind, pointerId: this.action.pointerId, pointerType: this.action.pointerType } : null,
+      touches: [...this.touches.keys()], gesture: this.tg ? this.tg.mode : null,
+      outside: this.outside ? [...this.outside.keys()] : [], mousePan: this.mousePan ? this.mousePan.id : null,
+      zoom: +this.view.z.toFixed(3), renderPending: !!this._rq,
+    };
+  }
+  sampleDiagnostics() {
+    const t = now(), visible = document.visibilityState === 'visible';
+    const gap = t - this.diagLastAt;
+    if (visible && this.diagWasVisible && gap > 2500) {
+      this.healthLog.push({ at: new Date().toISOString(), kind: 'event-loop-gap', gapMs: Math.round(gap), state: this.diagnosticState() });
+      if (this.healthLog.length > 20) this.healthLog.shift();
+    }
+    this.diagLastAt = t;
+    this.diagWasVisible = visible;
+    this.persistDiagnostics('interval');
+  }
+  logRuntimeError(kind, value) {
+    const err = value instanceof Error ? value : null;
+    this.runtimeErrors.push({ at: new Date().toISOString(), kind, message: (err ? `${err.name}: ${err.message}` : String(value || '')).slice(0, 500), stack: err && err.stack ? err.stack.slice(0, 1200) : '' });
+    if (this.runtimeErrors.length > 10) this.runtimeErrors.shift();
+    this.persistDiagnostics(kind);
+  }
+  persistDiagnostics(reason) {
+    try {
+      const strokes = (this.inputLog || []).slice(-3).map((s) => ({ at: s.at, z: s.z, scribble: s.scribble, dropped: s.dropped, rawN: s.rawN }));
+      const snapshot = {
+        schema: 1, savedAt: new Date().toISOString(), reason,
+        state: this.diagnosticState(), health: this.healthLog.slice(-20), errors: this.runtimeErrors.slice(-10),
+        strokes, touches: (this.touchLog || []).slice(-50), inputEvents: this.inputEvents.slice(-80),
+      };
+      localStorage.setItem(DIAG_STORAGE_KEY, JSON.stringify(snapshot));
+    } catch (_) {}
   }
   logInputEvent(type, e = null) {
     if (!this.inputEvents) this.inputEvents = [];
@@ -484,6 +539,8 @@ export class Engine {
     this.note = note;
     for (const p of pages) this.pvs.push(this.createPV(p));
     this.loaded = true;
+    this.logInputEvent('engine-load');
+    this.persistDiagnostics('engine-load');
     this.viewInit = false;
     this.layout();
     if (this.sw) this.initView();
@@ -500,6 +557,7 @@ export class Engine {
     return pv;
   }
   unload() {
+    this.logInputEvent('engine-unload');
     if (this.action) this.cancelAction();
     this.commitText();
     this.clearSelection();
@@ -2240,13 +2298,10 @@ export class Engine {
   }
   inputLogText() {
     return JSON.stringify({
-      ua: navigator.userAgent, dpr: this.dpr,
-      state: {
-        loaded: this.loaded, visible: document.visibilityState,
-        action: this.action ? { kind: this.action.kind, pointerId: this.action.pointerId, pointerType: this.action.pointerType } : null,
-        touches: [...this.touches.keys()], gesture: this.tg ? this.tg.mode : null,
-        outside: this.outside ? [...this.outside.keys()] : [], mousePan: this.mousePan ? this.mousePan.id : null,
-      },
+      capturedAt: new Date().toISOString(), ua: navigator.userAgent, dpr: this.dpr,
+      state: this.diagnosticState(),
+      previousSnapshot: this.previousDiagnostics,
+      health: this.healthLog || [], errors: this.runtimeErrors || [],
       strokes: this.inputLog || [], touches: this.touchLog || [], inputEvents: this.inputEvents || [],
     });
   }

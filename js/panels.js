@@ -4,9 +4,9 @@ import { icon } from './icons.js';
 import { settings, saveSettings, ACCENTS, resetSettings } from './settings.js';
 import * as ui from './ui.js';
 import * as store from './store.js';
-import { LOGO } from './library.js?v=1.6.13';
+import { LOGO } from './library.js?v=1.6.14';
 
-export const VERSION = '1.6.13';
+export const VERSION = '1.6.14';
 
 function fmtBytes(b) {
   if (!b && b !== 0) return '-';
@@ -136,7 +136,7 @@ export function openSettings(app) {
           ui.sheet({ title: '調査用データ', body: ta });
           setTimeout(() => ta.select(), 300);
         }
-      }), '直近に書いた 3 本の線と、最近の指の操作の入力データ（位置と時刻）。うまく動かないときに送ってもらうと原因を調べられます'),
+      }), '操作記録を端末内に定期保存します。固まって再起動した後も、設定から直前の状態をコピーできます（ノートの内容は含みません）'),
       ui.row('設定をリセット', btn('リセット', async () => {
         const ok = await ui.confirmDialog({ title: '設定をリセットしますか？', message: 'ペンの色や太さ、表示の設定が初期状態に戻ります（ノートは消えません）。', ok: 'リセット', danger: true });
         if (ok) {
